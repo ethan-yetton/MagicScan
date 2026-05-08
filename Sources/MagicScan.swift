@@ -21,6 +21,79 @@ struct MagicScanApp: App {
                 .frame(minWidth: 320, minHeight: 320)
         }
         .defaultSize(width: 480, height: 480)
+
+        Settings {
+            SettingsView()
+        }
+    }
+}
+
+enum HandPreference: String, CaseIterable, Identifiable {
+    case right, left
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .right: return "Right hand"
+        case .left: return "Left hand"
+        }
+    }
+    var chirality: VNChirality {
+        switch self {
+        case .right: return .right
+        case .left: return .left
+        }
+    }
+    static let storageKey = "preferredHand"
+    static var current: HandPreference {
+        let raw = UserDefaults.standard.string(forKey: storageKey) ?? ""
+        return HandPreference(rawValue: raw) ?? .right
+    }
+}
+
+enum DieKind: String, CaseIterable, Identifiable {
+    case d6, d20
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .d6: return "D6"
+        case .d20: return "D20"
+        }
+    }
+    var faceCount: Int {
+        switch self {
+        case .d6: return 6
+        case .d20: return 20
+        }
+    }
+    static let storageKey = "dieKind"
+    static var current: DieKind {
+        let raw = UserDefaults.standard.string(forKey: storageKey) ?? ""
+        return DieKind(rawValue: raw) ?? .d6
+    }
+}
+
+struct SettingsView: View {
+    @AppStorage(HandPreference.storageKey) private var preferred: String = HandPreference.right.rawValue
+    @AppStorage(DieKind.storageKey) private var die: String = DieKind.d6.rawValue
+
+    var body: some View {
+        Form {
+            Picker("Tracked hand", selection: $preferred) {
+                ForEach(HandPreference.allCases) { pref in
+                    Text(pref.label).tag(pref.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Picker("Die", selection: $die) {
+                ForEach(DieKind.allCases) { kind in
+                    Text(kind.label).tag(kind.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+        .padding(20)
+        .frame(width: 320)
     }
 }
 
@@ -28,47 +101,102 @@ struct ContentView: View {
     @EnvironmentObject var camera: CameraController
 
     var body: some View {
-        CameraPreview(session: camera.session, hands: camera.hands)
-            .overlay(alignment: .topLeading) {
-                if camera.isRecording {
-                    HStack(spacing: 6) {
-                        Circle().fill(.red).frame(width: 10, height: 10)
-                        Text("REC").font(.caption.weight(.bold))
-                    }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(.black.opacity(0.6), in: Capsule())
-                    .padding(20)
-                }
-            }
-            .overlay(alignment: .bottom) {
-                if camera.fingerCount > 0 {
-                    Text("\(camera.fingerCount) finger\(camera.fingerCount == 1 ? "" : "s")")
-                        .font(.system(.title2, design: .rounded).weight(.bold))
+        VStack(spacing: 0) {
+            CameraPreview(session: camera.session, hands: camera.hands)
+                .overlay(alignment: .topLeading) {
+                    if camera.isRecording {
+                        HStack(spacing: 6) {
+                            Circle().fill(.red).frame(width: 10, height: 10)
+                            Text("REC").font(.caption.weight(.bold))
+                        }
                         .foregroundColor(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
                         .background(.black.opacity(0.6), in: Capsule())
-                        .padding(.bottom, 24)
+                        .padding(20)
+                    }
                 }
-            }
-            .overlay(alignment: .bottomTrailing) {
-                Button { camera.toggleRecording() } label: {
-                    ZStack {
-                        Circle().fill(.black.opacity(0.6)).frame(width: 56, height: 56)
-                        if camera.isRecording {
-                            RoundedRectangle(cornerRadius: 4).fill(.red).frame(width: 22, height: 22)
-                        } else {
-                            Circle().fill(.red).frame(width: 22, height: 22)
+                .overlay(alignment: .bottom) {
+                    if camera.fingerCount > 0 {
+                        Text("\(camera.fingerCount) finger\(camera.fingerCount == 1 ? "" : "s")")
+                            .font(.system(.title2, design: .rounded).weight(.bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(.black.opacity(0.6), in: Capsule())
+                            .padding(.bottom, 24)
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    Button { camera.toggleRecording() } label: {
+                        ZStack {
+                            Circle().fill(.black.opacity(0.6)).frame(width: 56, height: 56)
+                            if camera.isRecording {
+                                RoundedRectangle(cornerRadius: 4).fill(.red).frame(width: 22, height: 22)
+                            } else {
+                                Circle().fill(.red).frame(width: 22, height: 22)
+                            }
                         }
                     }
+                    .buttonStyle(.plain)
+                    .help(camera.isRecording ? "Stop recording" : "Start recording")
+                    .padding(24)
                 }
-                .buttonStyle(.plain)
-                .help(camera.isRecording ? "Stop recording" : "Start recording")
-                .padding(24)
+
+            GameTextBox(messages: camera.gameMessages)
+        }
+        .onAppear { camera.start() }
+    }
+}
+
+struct GameTextBox: View {
+    let messages: [String]
+    private static let bottomAnchor = "game-text-bottom"
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(messages.indices, id: \.self) { i in
+                        Text(messages[i])
+                            .font(.system(.title3, design: .monospaced).weight(.semibold))
+                            .foregroundColor(Color(white: 0.92))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    // Always-present zero-height sentinel at the very end.
+                    // Scrolling to this with anchor .bottom reliably parks
+                    // the latest message fully in view, even if the new
+                    // row's frame hasn't been measured yet by the time
+                    // scrollTo runs.
+                    Color.clear
+                        .frame(height: 0.5)
+                        .id(Self.bottomAnchor)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
             }
-            .onAppear { camera.start() }
+            .frame(height: 160)
+            .background(Color(white: 0.06))
+            .overlay(alignment: .top) {
+                Rectangle()
+                    .fill(Color(white: 0.25))
+                    .frame(height: 1)
+            }
+            .onAppear {
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+            }
+            .onChange(of: messages.count) { _ in
+                // Snap immediately so the bottom is correct even if the
+                // animated follow-up gets interrupted, then animate the
+                // visual settle once SwiftUI has laid out the new row.
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -115,6 +243,11 @@ struct HandPose: Equatable {
     /// Hand roll in radians, derived from wrist→middleMCP angle. 0 means
     /// fingers point up; +π/2 means fingers point right (in image space).
     let roll: Float?
+    /// Knuckle span (indexMCP→littleMCP) in normalized image coords. Grows
+    /// as the hand moves toward the camera and is invariant to finger
+    /// curl, so dSize/dt > 0 reads as "forward motion." 0 if joints
+    /// weren't confidently detected.
+    let size: Float
 }
 
 final class CameraController: NSObject, ObservableObject {
@@ -122,6 +255,7 @@ final class CameraController: NSObject, ObservableObject {
     @Published var fingerCount: Int = 0
     @Published var isRecording: Bool = false
     @Published var dieResult: Int?
+    @Published var gameMessages: [String] = []
 
     let session = AVCaptureSession()
 
@@ -166,6 +300,12 @@ final class CameraController: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.dieResult != newResult else { return }
             self.dieResult = newResult
+        }
+    }
+
+    func appendGameMessage(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.gameMessages.append(message)
         }
     }
 
@@ -466,7 +606,10 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
 
         let observations = handPoseRequest.results ?? []
-        let newHands = observations.compactMap { Self.extractPose($0) }
+        let preferredChirality = HandPreference.current.chirality
+        let newHands = observations
+            .filter { $0.chirality == preferredChirality }
+            .compactMap { Self.extractPose($0) }
         let newFingerCount = newHands.reduce(0) { acc, h in
             acc + h.fingers.lazy.filter(\.extended).count
         }
@@ -573,7 +716,12 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
             roll = atan2(dx, dy)
         }
 
-        return HandPose(fingers: fingers, palm: palm, roll: roll)
+        var size: Float = 0
+        if let idx = pt(.indexMCP), let lit = pt(.littleMCP) {
+            size = Float(hypot(idx.x - lit.x, idx.y - lit.y))
+        }
+
+        return HandPose(fingers: fingers, palm: palm, roll: roll, size: size)
     }
 }
 
@@ -703,9 +851,11 @@ final class PreviewView: NSView {
 
 struct OrbView: View {
     @EnvironmentObject var camera: CameraController
+    @AppStorage(DieKind.storageKey) private var dieKind: String = DieKind.d6.rawValue
 
     var body: some View {
         OrbSceneView(camera: camera, hand: camera.hands.first)
+            .id(dieKind)
             .background(Color(white: 0.04))
             .ignoresSafeArea()
             .overlay(alignment: .top) {
@@ -847,9 +997,19 @@ struct OrbSceneView: NSViewRepresentable {
         }
     }
 
+    /// Build the die geometry for the configured kind. The returned
+    /// geometry's per-face material order matches the face-number layout
+    /// used by `orientationFor(faceNumber:kind:)`.
+    static func makeDieGeometry(kind: DieKind = .current) -> SCNGeometry {
+        switch kind {
+        case .d6: return makeD6Geometry()
+        case .d20: return makeD20Geometry()
+        }
+    }
+
     /// Six-faced cube with procedurally-drawn pip face textures laid out
     /// so opposite faces sum to seven (1↔6, 2↔5, 3↔4).
-    static func makeDieGeometry() -> SCNGeometry {
+    static func makeD6Geometry() -> SCNGeometry {
         let box = SCNBox(width: 1.4, height: 1.4, length: 1.4, chamferRadius: 0.08)
         // SCNBox material order: front (+Z), right (+X), back (-Z),
         // left (-X), top (+Y), bottom (-Y).
@@ -900,20 +1060,20 @@ struct OrbSceneView: NSViewRepresentable {
         return image
     }
 
-    /// Object-space face normals paired with the number painted on each
-    /// face. Matches the material order in `makeDieGeometry`.
-    static let dieFaceNormals: [(SIMD3<Float>, Int)] = [
-        (SIMD3(0, 0,  1), 1),
-        (SIMD3(1, 0,  0), 3),
-        (SIMD3(0, 0, -1), 6),
-        (SIMD3(-1, 0, 0), 4),
-        (SIMD3(0,  1, 0), 2),
-        (SIMD3(0, -1, 0), 5),
-    ]
-
     /// Object-space orientation that places the given face number's
-    /// normal pointing toward the camera (+Z world).
-    static func orientationFor(faceNumber: Int) -> simd_quatf {
+    /// normal pointing toward the camera (+Z world). Dispatches by kind.
+    static func orientationFor(faceNumber: Int, kind: DieKind = .current) -> simd_quatf {
+        switch kind {
+        case .d6: return d6Orientation(faceNumber: faceNumber)
+        case .d20:
+            if let n = d20FaceNormal(for: faceNumber) {
+                return simd_quatf(from: n, to: SIMD3<Float>(0, 0, 1))
+            }
+            return simd_quatf(angle: 0, axis: SIMD3(0, 1, 0))
+        }
+    }
+
+    private static func d6Orientation(faceNumber: Int) -> simd_quatf {
         switch faceNumber {
         case 1: return simd_quatf(angle: 0,        axis: SIMD3(0, 1, 0))
         case 2: return simd_quatf(angle:  .pi / 2, axis: SIMD3(1, 0, 0))
@@ -923,6 +1083,188 @@ struct OrbSceneView: NSViewRepresentable {
         case 6: return simd_quatf(angle:  .pi,     axis: SIMD3(1, 0, 0))
         default: return simd_quatf(angle: 0, axis: SIMD3(0, 1, 0))
         }
+    }
+
+    /// 20-sided icosahedral die. Each triangular face is its own
+    /// sub-element with a number-stamped material; antipodal pairs are
+    /// numbered to sum to 21 (1↔20, 2↔19, …, 10↔11).
+    static func makeD20Geometry() -> SCNGeometry {
+        let layout = d20Layout
+
+        var positions: [SIMD3<Float>] = []
+        var normals: [SIMD3<Float>] = []
+        var uvs: [SIMD2<Float>] = []
+        positions.reserveCapacity(60)
+        normals.reserveCapacity(60)
+        uvs.reserveCapacity(60)
+        for face in layout.faces {
+            let a = layout.vertices[face.indices.0]
+            let b = layout.vertices[face.indices.1]
+            let c = layout.vertices[face.indices.2]
+            positions += [a, b, c]
+            normals += [face.normal, face.normal, face.normal]
+            // UV winding swapped (v0/v1) so the chirality matches the
+            // CCW-from-outside geometry — otherwise the digit textures
+            // sample mirrored.
+            uvs += [
+                SIMD2<Float>(0.94, 0.08),
+                SIMD2<Float>(0.06, 0.08),
+                SIMD2<Float>(0.50, 0.94),
+            ]
+        }
+
+        let posData = Data(bytes: positions, count: MemoryLayout<SIMD3<Float>>.stride * positions.count)
+        let nrmData = Data(bytes: normals,   count: MemoryLayout<SIMD3<Float>>.stride * normals.count)
+        let uvData  = Data(bytes: uvs,       count: MemoryLayout<SIMD2<Float>>.stride * uvs.count)
+
+        let posSrc = SCNGeometrySource(data: posData, semantic: .vertex,
+                                        vectorCount: positions.count,
+                                        usesFloatComponents: true,
+                                        componentsPerVector: 3,
+                                        bytesPerComponent: MemoryLayout<Float>.size,
+                                        dataOffset: 0,
+                                        dataStride: MemoryLayout<SIMD3<Float>>.stride)
+        let nrmSrc = SCNGeometrySource(data: nrmData, semantic: .normal,
+                                        vectorCount: normals.count,
+                                        usesFloatComponents: true,
+                                        componentsPerVector: 3,
+                                        bytesPerComponent: MemoryLayout<Float>.size,
+                                        dataOffset: 0,
+                                        dataStride: MemoryLayout<SIMD3<Float>>.stride)
+        let uvSrc  = SCNGeometrySource(data: uvData, semantic: .texcoord,
+                                        vectorCount: uvs.count,
+                                        usesFloatComponents: true,
+                                        componentsPerVector: 2,
+                                        bytesPerComponent: MemoryLayout<Float>.size,
+                                        dataOffset: 0,
+                                        dataStride: MemoryLayout<SIMD2<Float>>.stride)
+
+        var elements: [SCNGeometryElement] = []
+        var materials: [SCNMaterial] = []
+        for (i, face) in layout.faces.enumerated() {
+            let indices: [Int32] = [Int32(i*3), Int32(i*3+1), Int32(i*3+2)]
+            let data = Data(bytes: indices, count: MemoryLayout<Int32>.size * indices.count)
+            let element = SCNGeometryElement(data: data,
+                                              primitiveType: .triangles,
+                                              primitiveCount: 1,
+                                              bytesPerIndex: MemoryLayout<Int32>.size)
+            elements.append(element)
+
+            let m = SCNMaterial()
+            m.diffuse.contents = makeNumberFaceImage(number: face.number)
+            m.lightingModel = .physicallyBased
+            m.roughness.contents = 0.5
+            m.metalness.contents = 0.05
+            m.isDoubleSided = true
+            materials.append(m)
+        }
+
+        let geom = SCNGeometry(sources: [posSrc, nrmSrc, uvSrc], elements: elements)
+        geom.materials = materials
+        return geom
+    }
+
+    struct D20Layout {
+        struct Face {
+            let indices: (Int, Int, Int)
+            let normal: SIMD3<Float>
+            let number: Int
+        }
+        let vertices: [SIMD3<Float>]
+        let faces: [Face]
+    }
+
+    /// Cached icosahedron vertices + face data with antipodal face
+    /// numbers (pairs sum to 21).
+    static let d20Layout: D20Layout = {
+        let phi: Float = (1 + sqrt(5.0)) / 2
+        let raw: [SIMD3<Float>] = [
+            SIMD3(-1,  phi,  0), SIMD3( 1,  phi,  0),
+            SIMD3(-1, -phi,  0), SIMD3( 1, -phi,  0),
+            SIMD3( 0, -1,  phi), SIMD3( 0,  1,  phi),
+            SIMD3( 0, -1, -phi), SIMD3( 0,  1, -phi),
+            SIMD3( phi, 0, -1), SIMD3( phi, 0,  1),
+            SIMD3(-phi, 0, -1), SIMD3(-phi, 0,  1),
+        ]
+        // Match the d6's corner-to-center distance (√3 · 0.7) so both
+        // dice occupy a similar visual volume.
+        let circumradius = sqrt(1 + phi * phi)
+        let target: Float = 0.7 * sqrt(3)
+        let scale = target / circumradius
+        let vertices = raw.map { $0 * scale }
+
+        let triples: [(Int, Int, Int)] = [
+            (0,11, 5), (0, 5, 1), (0, 1, 7), (0, 7,10), (0,10,11),
+            (1, 5, 9), (5,11, 4), (11,10, 2), (10, 7, 6), (7, 1, 8),
+            (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
+            (4, 9, 5), (2, 4,11), (6, 2,10), (8, 6, 7), (9, 8, 1),
+        ]
+        let normals: [SIMD3<Float>] = triples.map {
+            let c = (vertices[$0.0] + vertices[$0.1] + vertices[$0.2]) / 3
+            return simd_normalize(c)
+        }
+
+        var number = [Int](repeating: 0, count: 20)
+        var assigned = [Bool](repeating: false, count: 20)
+        var nextLow = 1
+        for i in 0..<20 where !assigned[i] {
+            var bestJ = -1
+            var bestDot: Float = 2
+            for j in 0..<20 where !assigned[j] && j != i {
+                let d = simd_dot(normals[i], normals[j])
+                if d < bestDot { bestDot = d; bestJ = j }
+            }
+            number[i] = nextLow
+            number[bestJ] = 21 - nextLow
+            assigned[i] = true
+            assigned[bestJ] = true
+            nextLow += 1
+        }
+
+        let faces = triples.enumerated().map { i, t in
+            D20Layout.Face(indices: t, normal: normals[i], number: number[i])
+        }
+        return D20Layout(vertices: vertices, faces: faces)
+    }()
+
+    static func d20FaceNormal(for number: Int) -> SIMD3<Float>? {
+        d20Layout.faces.first(where: { $0.number == number })?.normal
+    }
+
+    /// Dark-background number face used for the D20. Adds an underline
+    /// to 6/9 to disambiguate when read from above. Numbers are sized to
+    /// fit inside the triangular UV region's inscribed circle.
+    static func makeNumberFaceImage(number: Int) -> NSImage {
+        let size: CGFloat = 256
+        let image = NSImage(size: NSSize(width: size, height: size))
+        image.lockFocus()
+
+        NSColor(calibratedRed: 0.18, green: 0.22, blue: 0.32, alpha: 1).set()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
+
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 72, weight: .heavy),
+            .foregroundColor: NSColor(calibratedRed: 0.95, green: 0.92, blue: 0.78, alpha: 1),
+        ]
+        if number == 6 || number == 9 {
+            attrs[.underlineStyle] = NSUnderlineStyle.thick.rawValue
+            attrs[.underlineColor] = NSColor(calibratedRed: 0.95, green: 0.92, blue: 0.78, alpha: 1)
+        }
+        let s = NSAttributedString(string: "\(number)", attributes: attrs)
+        let bounds = s.size()
+        // The UV triangle's centroid is at (0.5, 0.367) where y=0 is the
+        // wide base. NSImage lockFocus draws bottom-up, but SceneKit
+        // samples the texture with UV (0,0) at top-left, so we flip y to
+        // land the glyph at the actual centroid of the rendered face.
+        // The -bounds.height*0.18 nudge accounts for line-leading above
+        // the cap so the digit's optical center sits on the centroid.
+        let cx = size * 0.5
+        let cy = size * (1 - 0.367)
+        s.draw(at: NSPoint(x: cx - bounds.width / 2,
+                            y: cy - bounds.height / 2 - bounds.height * 0.18))
+
+        image.unlockFocus()
+        return image
     }
 
     enum DieState {
@@ -958,6 +1300,11 @@ struct OrbSceneView: NSViewRepresentable {
         // only adjacent frames is too narrow when smoothing is in play.
         private var peakPress: Float = 0
         private var peakSpeed: Float = 0
+        // Peak rate at which the knuckle span has been growing recently.
+        // Only forward (toward-camera) motion contributes — pulling back
+        // to wind up shrinks the span and is excluded from this peak.
+        private var peakForwardSpeed: Float = 0
+        private var smoothedSize: Float = 0
         private var prevPalm = SIMD2<Float>(0.5, 0.5)
         private var lastTime: TimeInterval = 0
 
@@ -968,6 +1315,7 @@ struct OrbSceneView: NSViewRepresentable {
             var targetTips = Array(repeating: SIMD2<Float>(0.5, 0.5), count: 5)
             var targetStrengths: [Float] = [0, 0, 0, 0, 0]
             var targetRoll: Float = 0
+            var targetSize: Float = smoothedSize
             let presenceTarget: Float = (targetHand != nil) ? 1 : 0
             if let hand = targetHand {
                 for (i, f) in hand.fingers.prefix(5).enumerated() {
@@ -977,6 +1325,7 @@ struct OrbSceneView: NSViewRepresentable {
                     targetStrengths[i] = f.pressStrength
                 }
                 targetRoll = hand.roll ?? 0
+                if hand.size > 0 { targetSize = hand.size }
             }
 
             for i in 0..<5 {
@@ -985,16 +1334,22 @@ struct OrbSceneView: NSViewRepresentable {
             }
             smoothedRoll += (targetRoll - smoothedRoll) * 0.3
             smoothedPresence += (presenceTarget - smoothedPresence) * 0.2
+            let prevSize = smoothedSize
+            smoothedSize += (targetSize - smoothedSize) * 0.4
 
             let totalPress = smoothedStrengths.reduce(0, +)
             let palm = (smoothedTips.reduce(SIMD2<Float>.zero, +)) / 5
             let palmDelta = palm - prevPalm
             let palmSpeed = sqrt(palmDelta.x * palmDelta.x + palmDelta.y * palmDelta.y) / max(dt, 1e-3)
+            // Positive when knuckle span is growing (hand moving toward
+            // camera), negative when shrinking (winding up / pulling back).
+            let sizeVelocity = (smoothedSize - prevSize) / max(dt, 1e-3)
 
             // Decay peaks ~5%/frame and ~8%/frame so a high value sticks
             // around for ~1 second after the moment we saw it.
             peakPress = max(peakPress * 0.95, totalPress)
             peakSpeed = max(peakSpeed * 0.92, palmSpeed)
+            peakForwardSpeed = max(peakForwardSpeed * 0.92, max(0, sizeVelocity))
 
             switch dieState {
             case .tracking:
@@ -1007,10 +1362,12 @@ struct OrbSceneView: NSViewRepresentable {
                 // the fist is enough to roll the die — but if there was
                 // motion it scales the spin speed up.
                 let releasedFromGrip = peakPress > 1.2 && totalPress < 0.5
-                // Require an actual hand movement during the release —
-                // just opening a still fist shouldn't roll.
-                let hasMotion = peakSpeed > 0.6
-                if releasedFromGrip && hasMotion {
+                // Require forward motion (knuckle span growing — hand
+                // moving toward the camera) during the release. A wind-up
+                // pulls the hand back, shrinking the span, so it doesn't
+                // contribute to peakForwardSpeed and won't trigger a roll.
+                let hasForwardMotion = peakForwardSpeed > 0.25
+                if releasedFromGrip && hasForwardMotion {
                     let throwSpeed = max(palmSpeed, peakSpeed)
                     let baseSpeed: Float = 16
                     let speed = max(baseSpeed, min(50, throwSpeed * 10))
@@ -1027,11 +1384,13 @@ struct OrbSceneView: NSViewRepresentable {
                     let rawLen = sqrt(raw.x * raw.x + raw.y * raw.y + raw.z * raw.z)
                     let axis = rawLen > 0.001 ? raw / rawLen : SIMD3<Float>(1, 0, 0)
                     angularVelocity = axis * speed
-                    rolledFace = Int.random(in: 1...6)
+                    rolledFace = Int.random(in: 1...DieKind.current.faceCount)
                     dieResult = nil
                     dieState = .spinning
                     peakPress = 0
                     peakSpeed = 0
+                    peakForwardSpeed = 0
+                    camera?.appendGameMessage("YOU ROLLED THE DIE")
                 }
             case .spinning:
                 let speed = sqrt(angularVelocity.x * angularVelocity.x
@@ -1056,6 +1415,7 @@ struct OrbSceneView: NSViewRepresentable {
                     if let face = rolledFace {
                         dieOrientation = OrbSceneView.orientationFor(faceNumber: face)
                         dieResult = face
+                        camera?.appendGameMessage("YOU ROLLED A \(face)")
                     }
                     rolledFace = nil
                     angularVelocity = .zero
@@ -1067,6 +1427,7 @@ struct OrbSceneView: NSViewRepresentable {
                     dieState = .tracking
                     peakPress = 0
                     peakSpeed = 0
+                    peakForwardSpeed = 0
                 }
             }
 
