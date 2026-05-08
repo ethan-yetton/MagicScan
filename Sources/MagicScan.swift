@@ -1007,7 +1007,10 @@ struct OrbSceneView: NSViewRepresentable {
                 // the fist is enough to roll the die — but if there was
                 // motion it scales the spin speed up.
                 let releasedFromGrip = peakPress > 1.2 && totalPress < 0.5
-                if releasedFromGrip {
+                // Require an actual hand movement during the release —
+                // just opening a still fist shouldn't roll.
+                let hasMotion = peakSpeed > 0.6
+                if releasedFromGrip && hasMotion {
                     let throwSpeed = max(palmSpeed, peakSpeed)
                     let baseSpeed: Float = 16
                     let speed = max(baseSpeed, min(50, throwSpeed * 10))
