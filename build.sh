@@ -29,7 +29,22 @@ codesign --force --sign - "$APP_DIR"
 
 echo "Built $APP_DIR"
 
+# Install to /Applications so LaunchServices indexes the bundle. Without
+# this, the Screen Recording toggle in System Settings stays empty even
+# though the TCC entry exists, because the Privacy UI joins TCC against
+# LaunchServices and skips unregistered bundles.
+INSTALL_DIR="/Applications/$APP_NAME.app"
+rm -rf "$INSTALL_DIR"
+cp -R "$APP_DIR" "$INSTALL_DIR"
+# Re-sign in place so the cdhash matches the installed binary.
+codesign --force --sign - "$INSTALL_DIR"
+# Nudge LaunchServices to pick it up immediately.
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister \
+    -f "$INSTALL_DIR" >/dev/null 2>&1 || true
+
 # Symlink into the project tree so existing `open .../build/MagicScan.app`
-# invocations keep working.
+# invocations keep working — point at the installed copy.
 mkdir -p "$ROOT/build"
-ln -sfn "$APP_DIR" "$ROOT/build/$APP_NAME.app"
+ln -sfn "$INSTALL_DIR" "$ROOT/build/$APP_NAME.app"
+
+echo "Installed $INSTALL_DIR"

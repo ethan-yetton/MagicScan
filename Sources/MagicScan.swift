@@ -3,6 +3,7 @@ import AVFoundation
 import AppKit
 import Vision
 import SceneKit
+import ScreenCaptureKit
 
 @main
 struct MagicScanApp: App {
@@ -15,7 +16,7 @@ struct MagicScanApp: App {
                 .frame(minWidth: 640, minHeight: 480)
         }
 
-        Window("Orb", id: "orb") {
+        Window("Die Roller", id: "orb") {
             OrbView()
                 .environmentObject(camera)
                 .frame(minWidth: 320, minHeight: 320)
@@ -55,8 +56,8 @@ enum DieKind: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .d6: return "D6"
-        case .d20: return "D20"
+        case .d6: return "Casino"
+        case .d20: return "Adventure"
         }
     }
     var faceCount: Int {
@@ -72,9 +73,54 @@ enum DieKind: String, CaseIterable, Identifiable {
     }
 }
 
+/// How much forward (toward-camera) motion is needed to qualify a
+/// gripped hand as a throw. Lower threshold = easier to fire, at the
+/// cost of more false positives from incidental motion.
+enum ThrowSensitivity: String, CaseIterable, Identifiable {
+    case strict, normal, sensitive
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .strict: return "Strict"
+        case .normal: return "Normal"
+        case .sensitive: return "Sensitive"
+        }
+    }
+    /// Minimum forward displacement (growth in normalized knuckle span)
+    /// since the grip latched. Path A (slow deliberate throws) — paired
+    /// with a small palm-speed gate.
+    var forwardThreshold: Float {
+        switch self {
+        case .strict: return 0.04
+        case .normal: return 0.02
+        case .sensitive: return 0.008
+        }
+    }
+
+    /// Path B threshold — peak palm speed for "fast throw" detection.
+    /// Empirically the user's lateral / off-screen throws produce
+    /// peakSpd of 5–10 with near-zero knuckle-span growth, so a pure
+    /// growth-based check misses them entirely. This catches them
+    /// without firing on clearly-backward wind-ups (which we filter
+    /// separately by requiring growth > -0.005).
+    var peakSpeedThreshold: Float {
+        switch self {
+        case .strict: return 3.0
+        case .normal: return 1.5
+        case .sensitive: return 0.8
+        }
+    }
+    static let storageKey = "throwSensitivity"
+    static var current: ThrowSensitivity {
+        let raw = UserDefaults.standard.string(forKey: storageKey) ?? ""
+        return ThrowSensitivity(rawValue: raw) ?? .normal
+    }
+}
+
 struct SettingsView: View {
     @AppStorage(HandPreference.storageKey) private var preferred: String = HandPreference.right.rawValue
     @AppStorage(DieKind.storageKey) private var die: String = DieKind.d6.rawValue
+    @AppStorage(ThrowSensitivity.storageKey) private var sensitivity: String = ThrowSensitivity.normal.rawValue
 
     var body: some View {
         Form {
@@ -85,25 +131,64 @@ struct SettingsView: View {
             }
             .pickerStyle(.segmented)
 
-            Picker("Die", selection: $die) {
+            Picker("Mode", selection: $die) {
                 ForEach(DieKind.allCases) { kind in
                     Text(kind.label).tag(kind.rawValue)
                 }
             }
             .pickerStyle(.segmented)
+
+            Picker("Throw sensitivity", selection: $sensitivity) {
+                ForEach(ThrowSensitivity.allCases) { s in
+                    Text(s.label).tag(s.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
         }
         .padding(20)
-        .frame(width: 320)
+        .frame(width: 360)
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject var camera: CameraController
+    @AppStorage(DieKind.storageKey) private var dieKind: String = DieKind.d6.rawValue
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
         VStack(spacing: 0) {
-            CameraPreview(session: camera.session, hands: camera.hands)
-                .overlay(alignment: .topLeading) {
+            if dieKind == DieKind.d20.rawValue {
+                HStack(spacing: 0) {
+                    cameraPreview(embedOrb: true)
+                    DungeonMapView { camera.appendGameMessage($0) }
+                }
+                GameTextBox(messages: camera.gameMessages)
+            } else {
+                cameraPreview(embedOrb: false)
+            }
+        }
+        .onAppear {
+            camera.start()
+            // Only open the standalone die-roller window in Casino
+            // mode. Adventure mode embeds the die in the main window.
+            if dieKind == DieKind.d6.rawValue {
+                openWindow(id: "orb")
+            }
+        }
+        .onChange(of: dieKind) { newValue in
+            if newValue == DieKind.d20.rawValue {
+                dismissWindow(id: "orb")
+            } else {
+                openWindow(id: "orb")
+            }
+        }
+    }
+
+    private func cameraPreview(embedOrb: Bool) -> some View {
+        CameraPreview(session: camera.session, hands: camera.hands)
+            .overlay(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: 12) {
                     if camera.isRecording {
                         HStack(spacing: 6) {
                             Circle().fill(.red).frame(width: 10, height: 10)
@@ -113,39 +198,208 @@ struct ContentView: View {
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
                         .background(.black.opacity(0.6), in: Capsule())
-                        .padding(20)
+                    }
+                    if embedOrb {
+                        EmbeddedOrbView()
+                            .environmentObject(camera)
+                            .frame(width: 180, height: 180)
                     }
                 }
-                .overlay(alignment: .bottom) {
-                    if camera.fingerCount > 0 {
-                        Text("\(camera.fingerCount) finger\(camera.fingerCount == 1 ? "" : "s")")
-                            .font(.system(.title2, design: .rounded).weight(.bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 8)
-                            .background(.black.opacity(0.6), in: Capsule())
-                            .padding(.bottom, 24)
+                .padding(20)
+            }
+            .overlay(alignment: .topTrailing) {
+                if !camera.debugText.isEmpty {
+                    Text(camera.debugText)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(8)
+                        .background(.black.opacity(0.7),
+                                    in: RoundedRectangle(cornerRadius: 6))
+                        .padding(12)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                Button { camera.toggleRecording() } label: {
+                    ZStack {
+                        Circle().fill(.black.opacity(0.6)).frame(width: 56, height: 56)
+                        if camera.isRecording {
+                            RoundedRectangle(cornerRadius: 4).fill(.red).frame(width: 22, height: 22)
+                        } else {
+                            Circle().fill(.red).frame(width: 22, height: 22)
+                        }
                     }
                 }
-                .overlay(alignment: .bottomTrailing) {
-                    Button { camera.toggleRecording() } label: {
-                        ZStack {
-                            Circle().fill(.black.opacity(0.6)).frame(width: 56, height: 56)
-                            if camera.isRecording {
-                                RoundedRectangle(cornerRadius: 4).fill(.red).frame(width: 22, height: 22)
-                            } else {
-                                Circle().fill(.red).frame(width: 22, height: 22)
+                .buttonStyle(.plain)
+                .help(camera.isRecording ? "Stop recording" : "Start recording")
+                .padding(24)
+            }
+    }
+}
+
+enum DungeonTileKind {
+    case empty, chest, enemy, door
+}
+
+struct DungeonTile {
+    var kind: DungeonTileKind
+    var revealed: Bool
+}
+
+struct DungeonMap {
+    static let columns = 16
+    static let rows = 12
+
+    var tiles: [[DungeonTile]]
+    var floor: Int
+
+    static func make(floor: Int) -> DungeonMap {
+        var grid: [[DungeonTile]] = (0..<rows).map { _ in
+            (0..<columns).map { _ in
+                DungeonTile(kind: randomKind(), revealed: false)
+            }
+        }
+        // Guarantee at least one door so the floor is always escapable.
+        let hasDoor = grid.flatMap { $0 }.contains { $0.kind == .door }
+        if !hasDoor {
+            let r = Int.random(in: 0..<rows)
+            let c = Int.random(in: 0..<columns)
+            grid[r][c].kind = .door
+        }
+        // Spawn point: center, forced empty and pre-revealed.
+        let sr = rows / 2, sc = columns / 2
+        grid[sr][sc].kind = .empty
+        grid[sr][sc].revealed = true
+        return DungeonMap(tiles: grid, floor: floor)
+    }
+
+    private static func randomKind() -> DungeonTileKind {
+        switch Double.random(in: 0..<1) {
+        case ..<0.74: return .empty
+        case ..<0.86: return .chest
+        case ..<0.96: return .enemy
+        default:      return .door
+        }
+    }
+
+    func canReveal(row: Int, col: Int) -> Bool {
+        guard row >= 0, row < Self.rows, col >= 0, col < Self.columns else { return false }
+        if tiles[row][col].revealed { return false }
+        for (dr, dc) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let nr = row + dr, nc = col + dc
+            if nr >= 0, nr < Self.rows, nc >= 0, nc < Self.columns,
+               tiles[nr][nc].revealed {
+                return true
+            }
+        }
+        return false
+    }
+
+    mutating func reveal(row: Int, col: Int) -> DungeonTileKind? {
+        guard canReveal(row: row, col: col) else { return nil }
+        tiles[row][col].revealed = true
+        return tiles[row][col].kind
+    }
+}
+
+struct DungeonMapView: View {
+    @State private var map = DungeonMap.make(floor: 1)
+    var log: (String) -> Void
+
+    var body: some View {
+        GeometryReader { geo in
+            let cols = DungeonMap.columns
+            let rows = DungeonMap.rows
+            let side = min(geo.size.width / Double(cols),
+                           geo.size.height / Double(rows))
+            ZStack {
+                Color(white: 0.06)
+                VStack(spacing: 1) {
+                    ForEach(0..<rows, id: \.self) { r in
+                        HStack(spacing: 1) {
+                            ForEach(0..<cols, id: \.self) { c in
+                                tileView(row: r, col: c)
+                                    .frame(width: max(side - 1, 0),
+                                           height: max(side - 1, 0))
                             }
                         }
                     }
-                    .buttonStyle(.plain)
-                    .help(camera.isRecording ? "Stop recording" : "Start recording")
-                    .padding(24)
                 }
-
-            GameTextBox(messages: camera.gameMessages)
+                .frame(width: side * Double(cols), height: side * Double(rows))
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
-        .onAppear { camera.start() }
+        .overlay(alignment: .topLeading) {
+            Text("FLOOR \(map.floor)")
+                .font(.system(.caption, design: .monospaced).weight(.bold))
+                .foregroundColor(Color(white: 0.6))
+                .padding(8)
+        }
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(Color(white: 0.25))
+                .frame(width: 1)
+        }
+    }
+
+    @ViewBuilder
+    private func tileView(row: Int, col: Int) -> some View {
+        let tile = map.tiles[row][col]
+        let reachable = map.canReveal(row: row, col: col)
+        Button {
+            handleTap(row: row, col: col)
+        } label: {
+            ZStack {
+                Rectangle().fill(tileFill(tile: tile, reachable: reachable))
+                if tile.revealed {
+                    Text(glyph(for: tile.kind))
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(glyphColor(for: tile.kind))
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(!tile.revealed && !reachable)
+    }
+
+    private func handleTap(row: Int, col: Int) {
+        let tile = map.tiles[row][col]
+        if tile.revealed {
+            if tile.kind == .door {
+                map = DungeonMap.make(floor: map.floor + 1)
+                log("You descend to floor \(map.floor).")
+            }
+            return
+        }
+        guard let kind = map.reveal(row: row, col: col) else { return }
+        switch kind {
+        case .empty: log("You step into an empty space.")
+        case .chest: log("You find a treasure chest.")
+        case .enemy: log("You spot an enemy.")
+        case .door:  log("You find a door leading down. Click again to descend.")
+        }
+    }
+
+    private func tileFill(tile: DungeonTile, reachable: Bool) -> Color {
+        if tile.revealed { return Color(white: 0.28) }
+        return reachable ? Color(white: 0.22) : Color(white: 0.10)
+    }
+
+    private func glyph(for kind: DungeonTileKind) -> String {
+        switch kind {
+        case .empty: return "·"
+        case .chest: return "$"
+        case .enemy: return "E"
+        case .door:  return "⌂"
+        }
+    }
+
+    private func glyphColor(for kind: DungeonTileKind) -> Color {
+        switch kind {
+        case .empty: return Color(white: 0.55)
+        case .chest: return Color(red: 0.95, green: 0.78, blue: 0.30)
+        case .enemy: return Color(red: 0.92, green: 0.32, blue: 0.32)
+        case .door:  return Color(red: 0.40, green: 0.78, blue: 0.95)
+        }
     }
 }
 
@@ -256,6 +510,14 @@ final class CameraController: NSObject, ObservableObject {
     @Published var isRecording: Bool = false
     @Published var dieResult: Int?
     @Published var gameMessages: [String] = []
+    @Published var debugText: String = ""
+
+    func updateDebugText(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.debugText != text else { return }
+            self.debugText = text
+        }
+    }
 
     let session = AVCaptureSession()
 
@@ -278,24 +540,9 @@ final class CameraController: NSObject, ObservableObject {
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var recordingStartTime: CMTime?
     private var recordingURL: URL?
-    private var recordingArmed: Bool = false
-
-    // Side-by-side orb compositing — touched only on videoQueue.
-    private var recordingIncludesOrb: Bool = false
-    private var offscreenOrbScene: SCNScene?
-    private var offscreenCrystalNode: SCNNode?
-    private var offscreenMarkerNodes: [SCNNode] = []
-    private var offscreenOrbRenderer: SCNRenderer?
-
-    // Latest orb state pushed from the live OrbSceneView's render loop.
-    private let orbSnapshotLock = NSLock()
-    private var latestOrbSnapshot: OrbSnapshot?
+    private var windowRecorder: WindowRecorder?
 
     func updateOrbSnapshot(_ snap: OrbSnapshot) {
-        orbSnapshotLock.lock()
-        latestOrbSnapshot = snap
-        orbSnapshotLock.unlock()
-
         let newResult = snap.dieResult
         DispatchQueue.main.async { [weak self] in
             guard let self, self.dieResult != newResult else { return }
@@ -307,11 +554,6 @@ final class CameraController: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.gameMessages.append(message)
         }
-    }
-
-    private func currentOrbSnapshot() -> OrbSnapshot? {
-        orbSnapshotLock.lock(); defer { orbSnapshotLock.unlock() }
-        return latestOrbSnapshot
     }
 
     func start() {
@@ -367,20 +609,45 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func startRecording() {
-        videoQueue.async { [weak self] in
-            guard let self, self.assetWriter == nil else { return }
-            self.recordingArmed = true
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let recorder = try await WindowRecorder.start(
+                    windowTitle: "MagicScan",
+                    onFrame: { [weak self] sample in
+                        self?.videoQueue.async {
+                            self?.appendWindowFrame(sample)
+                        }
+                    }
+                )
+                self.videoQueue.async { [weak self] in
+                    guard let self else { return }
+                    if self.assetWriter == nil {
+                        guard self.setupAssetWriter(width: recorder.pixelWidth,
+                                                    height: recorder.pixelHeight) else {
+                            Task { try? await recorder.stop() }
+                            return
+                        }
+                    }
+                    self.windowRecorder = recorder
+                }
+            } catch {
+                NSLog("MagicScan: window capture start failed — \(error.localizedDescription)")
+            }
         }
     }
 
     private func stopRecording() {
+        let recorder = self.windowRecorder
+        self.windowRecorder = nil
+        if let recorder { Task { try? await recorder.stop() } }
+
         videoQueue.async { [weak self] in
             guard let self else { return }
-            if self.recordingArmed && self.assetWriter == nil {
-                self.recordingArmed = false
+            guard let writer = self.assetWriter, let input = self.videoInput else {
+                DispatchQueue.main.async { self.isRecording = false }
                 return
             }
-            guard let writer = self.assetWriter, let input = self.videoInput else { return }
             let url = self.recordingURL
             input.markAsFinished()
             self.assetWriter = nil
@@ -400,30 +667,21 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func setupAssetWriter(width: Int, height: Int) -> Bool {
-        let snap = currentOrbSnapshot()
-        let orbActive = snap.map { -$0.lastUpdate.timeIntervalSinceNow < 1.0 } ?? false
-        self.recordingIncludesOrb = orbActive
-        if orbActive && offscreenOrbRenderer == nil {
-            setupOffscreenOrbScene()
-        }
-        let outputWidth = orbActive ? width + height : width
-        let outputHeight = height
-
         let url = makeOutputURL()
         do {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
             let settings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: outputWidth,
-                AVVideoHeightKey: outputHeight,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
             ]
             let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
 
             let attrs: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: outputWidth,
-                kCVPixelBufferHeightKey as String: outputHeight,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
             ]
             let adaptor = AVAssetWriterInputPixelBufferAdaptor(
                 assetWriterInput: input,
@@ -462,133 +720,18 @@ final class CameraController: NSObject, ObservableObject {
         return dir.appendingPathComponent("MagicScan-\(f.string(from: Date())).mp4")
     }
 
-    private func appendFrame(source: CVPixelBuffer, hands: [HandPose], pts: CMTime) {
+    private func appendWindowFrame(_ sample: CMSampleBuffer) {
         guard let writer = assetWriter, writer.status == .writing,
               let input = videoInput, input.isReadyForMoreMediaData,
               let adaptor = pixelBufferAdaptor,
-              let pool = adaptor.pixelBufferPool else { return }
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
 
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         if recordingStartTime == nil {
             recordingStartTime = pts
             writer.startSession(atSourceTime: pts)
         }
-
-        var outBuf: CVPixelBuffer?
-        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuf)
-        guard status == kCVReturnSuccess, let out = outBuf else { return }
-
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        CVPixelBufferLockBaseAddress(out, [])
-
-        let outW = CVPixelBufferGetWidth(out)
-        let outH = CVPixelBufferGetHeight(out)
-        let outRow = CVPixelBufferGetBytesPerRow(out)
-        let srcRow = CVPixelBufferGetBytesPerRow(source)
-        let cameraW = recordingIncludesOrb ? outW - outH : outW
-        let cameraBytes = cameraW * 4
-
-        if let outBase = CVPixelBufferGetBaseAddress(out),
-           let srcBase = CVPixelBufferGetBaseAddress(source) {
-            for y in 0..<outH {
-                memcpy(outBase.advanced(by: y * outRow),
-                       srcBase.advanced(by: y * srcRow),
-                       cameraBytes)
-            }
-
-            let cs = CGColorSpaceCreateDeviceRGB()
-            let info = CGBitmapInfo.byteOrder32Little.rawValue
-                     | CGImageAlphaInfo.premultipliedFirst.rawValue
-            if let ctx = CGContext(data: outBase, width: outW, height: outH,
-                                   bitsPerComponent: 8, bytesPerRow: outRow,
-                                   space: cs, bitmapInfo: info) {
-                if recordingIncludesOrb,
-                   let orbImage = renderOrbSnapshot(size: CGSize(width: outH, height: outH)) {
-                    ctx.draw(orbImage, in: CGRect(x: cameraW, y: 0,
-                                                  width: outH, height: outH))
-                }
-                Self.drawWireframe(in: ctx, hands: hands,
-                                   size: CGSize(width: cameraW, height: outH))
-            }
-        }
-
-        CVPixelBufferUnlockBaseAddress(out, [])
-        CVPixelBufferUnlockBaseAddress(source, .readOnly)
-
-        adaptor.append(out, withPresentationTime: pts)
-    }
-
-    private static func drawWireframe(in ctx: CGContext, hands: [HandPose], size: CGSize) {
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-
-        for hand in hands {
-            if hand.palm.count >= 2 {
-                ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.35).cgColor)
-                ctx.setLineWidth(2)
-                ctx.beginPath()
-                ctx.move(to: CGPoint(x: hand.palm[0].x * size.width,
-                                     y: hand.palm[0].y * size.height))
-                for p in hand.palm.dropFirst() {
-                    ctx.addLine(to: CGPoint(x: p.x * size.width, y: p.y * size.height))
-                }
-                ctx.strokePath()
-            }
-            for finger in hand.fingers {
-                guard finger.joints.count >= 2 else { continue }
-                if finger.extended {
-                    ctx.setStrokeColor(NSColor.systemGreen.cgColor)
-                    ctx.setLineWidth(5)
-                } else {
-                    ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.35).cgColor)
-                    ctx.setLineWidth(2.5)
-                }
-                ctx.beginPath()
-                ctx.move(to: CGPoint(x: finger.joints[0].x * size.width,
-                                     y: finger.joints[0].y * size.height))
-                for p in finger.joints.dropFirst() {
-                    ctx.addLine(to: CGPoint(x: p.x * size.width, y: p.y * size.height))
-                }
-                ctx.strokePath()
-
-                if finger.extended, let tip = finger.joints.last {
-                    let r: CGFloat = 8
-                    let center = CGPoint(x: tip.x * size.width, y: tip.y * size.height)
-                    let rect = CGRect(x: center.x - r, y: center.y - r,
-                                      width: r * 2, height: r * 2)
-                    ctx.setFillColor(NSColor.systemGreen.cgColor)
-                    ctx.fillEllipse(in: rect)
-                    ctx.setStrokeColor(NSColor.white.cgColor)
-                    ctx.setLineWidth(2)
-                    ctx.strokeEllipse(in: rect)
-                }
-            }
-        }
-    }
-
-    private func setupOffscreenOrbScene() {
-        let (scene, crystal, markers) = OrbSceneView.buildScene()
-        let device = MTLCreateSystemDefaultDevice()
-        let renderer = SCNRenderer(device: device, options: nil)
-        renderer.scene = scene
-
-        offscreenOrbScene = scene
-        offscreenCrystalNode = crystal
-        offscreenMarkerNodes = markers
-        offscreenOrbRenderer = renderer
-    }
-
-    private func renderOrbSnapshot(size: CGSize) -> CGImage? {
-        guard let renderer = offscreenOrbRenderer,
-              let crystal = offscreenCrystalNode,
-              let snap = currentOrbSnapshot() else { return nil }
-
-        OrbSceneView.applySnapshot(snap, toCrystal: crystal,
-                                   markers: offscreenMarkerNodes)
-
-        let nsImage = renderer.snapshot(atTime: 0, with: size,
-                                         antialiasingMode: .multisampling4X)
-        var rect = CGRect(origin: .zero, size: size)
-        return nsImage.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        adaptor.append(pixelBuffer, withPresentationTime: pts)
     }
 }
 
@@ -612,18 +755,6 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
             .compactMap { Self.extractPose($0) }
         let newFingerCount = newHands.reduce(0) { acc, h in
             acc + h.fingers.lazy.filter(\.extended).count
-        }
-
-        if recordingArmed {
-            recordingArmed = false
-            let w = CVPixelBufferGetWidth(pixelBuffer)
-            let h = CVPixelBufferGetHeight(pixelBuffer)
-            _ = setupAssetWriter(width: w, height: h)
-        }
-
-        if assetWriter != nil {
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            appendFrame(source: pixelBuffer, hands: newHands, pts: pts)
         }
 
         DispatchQueue.main.async { [weak self] in
@@ -722,6 +853,81 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
 
         return HandPose(fingers: fingers, palm: palm, roll: roll, size: size)
+    }
+}
+
+/// Captures the MagicScan main window via ScreenCaptureKit and forwards
+/// frames to a callback. Construction is via the async `start` factory so
+/// callers receive a fully-running stream with the actual pixel
+/// dimensions chosen for the AVAssetWriter.
+final class WindowRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
+    let pixelWidth: Int
+    let pixelHeight: Int
+
+    private let stream: SCStream
+    private let onFrame: (CMSampleBuffer) -> Void
+    private static let outputQueue = DispatchQueue(label: "magicscan.window-recorder")
+
+    private init(stream: SCStream, width: Int, height: Int,
+                 onFrame: @escaping (CMSampleBuffer) -> Void) {
+        self.stream = stream
+        self.pixelWidth = width
+        self.pixelHeight = height
+        self.onFrame = onFrame
+    }
+
+    static func start(windowTitle: String,
+                      onFrame: @escaping (CMSampleBuffer) -> Void) async throws -> WindowRecorder {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: true)
+        let bundleID = Bundle.main.bundleIdentifier
+        guard let window = content.windows.first(where: { w in
+            w.owningApplication?.bundleIdentifier == bundleID && w.title == windowTitle
+        }) else {
+            throw NSError(domain: "MagicScan.WindowRecorder", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey:
+                                     "Could not find window titled \(windowTitle)"])
+        }
+
+        let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+        // Round down to even dimensions so H.264 is happy.
+        var px = Int(window.frame.width * scale)
+        var py = Int(window.frame.height * scale)
+        if px % 2 != 0 { px -= 1 }
+        if py % 2 != 0 { py -= 1 }
+
+        let cfg = SCStreamConfiguration()
+        cfg.width = px
+        cfg.height = py
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        cfg.queueDepth = 5
+        cfg.showsCursor = false
+        cfg.capturesAudio = false
+
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let stream = SCStream(filter: filter, configuration: cfg, delegate: nil)
+        let recorder = WindowRecorder(stream: stream, width: px, height: py, onFrame: onFrame)
+        try stream.addStreamOutput(recorder, type: .screen,
+                                   sampleHandlerQueue: outputQueue)
+        try await stream.startCapture()
+        return recorder
+    }
+
+    func stop() async throws {
+        try await stream.stopCapture()
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+                of type: SCStreamOutputType) {
+        guard type == .screen, sampleBuffer.isValid else { return }
+        // Only forward "complete" frames — SCStream also delivers idle/blank
+        // status sample buffers with no real pixel data.
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+                sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = attachments.first?[.status] as? Int,
+              SCFrameStatus(rawValue: raw) == .complete else { return }
+        onFrame(sampleBuffer)
     }
 }
 
@@ -852,6 +1058,7 @@ final class PreviewView: NSView {
 struct OrbView: View {
     @EnvironmentObject var camera: CameraController
     @AppStorage(DieKind.storageKey) private var dieKind: String = DieKind.d6.rawValue
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
         OrbSceneView(camera: camera, hand: camera.hands.first)
@@ -868,6 +1075,54 @@ struct OrbView: View {
                         .background(.black.opacity(0.65),
                                     in: RoundedRectangle(cornerRadius: 28))
                         .padding(.top, 24)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .animation(.spring(response: 0.35, dampingFraction: 0.7),
+                       value: camera.dieResult)
+            // In Adventure mode the die is embedded in the main window,
+            // so the standalone window is redundant. Dismiss any time
+            // it would appear (auto-open at launch, manual menu pick,
+            // or a mode-switch while open).
+            .onAppear {
+                if dieKind == DieKind.d20.rawValue {
+                    dismissWindow(id: "orb")
+                }
+            }
+            .onChange(of: dieKind) { newValue in
+                if newValue == DieKind.d20.rawValue {
+                    dismissWindow(id: "orb")
+                }
+            }
+    }
+}
+
+/// Compact die-roller embedded in the camera preview during Adventure
+/// mode. Same scene as the standalone window, with smaller result text
+/// and a rounded frame.
+struct EmbeddedOrbView: View {
+    @EnvironmentObject var camera: CameraController
+    @AppStorage(DieKind.storageKey) private var dieKind: String = DieKind.d6.rawValue
+
+    var body: some View {
+        OrbSceneView(camera: camera, hand: camera.hands.first)
+            .id(dieKind)
+            .background(Color(white: 0.04))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.18), lineWidth: 1)
+            }
+            .overlay(alignment: .top) {
+                if let result = camera.dieResult {
+                    Text("\(result)")
+                        .font(.system(size: 36, weight: .black, design: .rounded))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.7),
+                                    in: RoundedRectangle(cornerRadius: 12))
+                        .padding(.top, 8)
                         .transition(.scale.combined(with: .opacity))
                 }
             }
@@ -1058,6 +1313,26 @@ struct OrbSceneView: NSViewRepresentable {
 
         image.unlockFocus()
         return image
+    }
+
+    /// Find the face whose orientation is closest to the current die
+    /// orientation. Used to settle the die to a face when the user
+    /// releases without a qualifying throw motion — picks whichever
+    /// face is currently most facing the camera.
+    static func nearestFace(to orientation: simd_quatf, kind: DieKind = .current) -> Int {
+        var bestFace = 1
+        var bestDot: Float = -1
+        for face in 1...kind.faceCount {
+            let target = orientationFor(faceNumber: face, kind: kind)
+            // Quaternion dot product; abs picks the shortest path.
+            let dot = abs(orientation.real * target.real
+                          + simd_dot(orientation.imag, target.imag))
+            if dot > bestDot {
+                bestDot = dot
+                bestFace = face
+            }
+        }
+        return bestFace
     }
 
     /// Object-space orientation that places the given face number's
@@ -1274,6 +1549,53 @@ struct OrbSceneView: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, SCNSceneRendererDelegate {
+        // Append-only debug log written to ~/Movies/MagicScan/throw-debug.log.
+        // Reset on first frame so each run is a clean trace.
+        private static let debugLogQueue = DispatchQueue(label: "magicscan.debug.log")
+        private static let debugLogURL: URL = {
+            let movies = FileManager.default
+                .urls(for: .moviesDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory())
+            let dir = movies.appendingPathComponent("MagicScan", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir.appendingPathComponent("throw-debug.log")
+        }()
+
+        static func debugLog(_ line: String) {
+            let stamp = String(format: "%.3f", Date().timeIntervalSince1970)
+            let full = "[\(stamp)] \(line)\n"
+            debugLogQueue.async {
+                guard let data = full.data(using: .utf8) else { return }
+                let url = debugLogURL
+                if FileManager.default.fileExists(atPath: url.path),
+                   let h = try? FileHandle(forWritingTo: url) {
+                    try? h.seekToEnd()
+                    try? h.write(contentsOf: data)
+                    try? h.close()
+                } else {
+                    try? data.write(to: url)
+                }
+            }
+        }
+
+        static func resetDebugLog() {
+            debugLogQueue.async {
+                try? FileManager.default.removeItem(at: debugLogURL)
+            }
+        }
+
+        /// Pick a random face number from the current die kind that is
+        /// NOT the given face. Guarantees the visual roll always lands
+        /// on a different face than the one currently up, so even slow
+        /// throws produce a clear "the die changed" moment.
+        static func randomFaceExcluding(_ excluded: Int) -> Int {
+            let count = DieKind.current.faceCount
+            guard count > 1 else { return 1 }
+            var pick = Int.random(in: 1..<count)  // 1...count-1
+            if pick >= excluded { pick += 1 }      // skip the excluded slot
+            return pick
+        }
+
         weak var crystalNode: SCNNode?
         var markerNodes: [SCNNode] = []
         weak var camera: CameraController?
@@ -1295,20 +1617,37 @@ struct OrbSceneView: NSViewRepresentable {
         // physics happen to favor certain orientations.
         private var rolledFace: Int?
 
-        // Throw detection. Peak trackers decay each frame so a brief grip
-        // followed by an open hand still registers as a throw — testing
-        // only adjacent frames is too narrow when smoothing is in play.
-        private var peakPress: Float = 0
+        // Throw detection. `wasGripped` latches when the hand crosses
+        // the grip threshold; `gripStartSize` anchors the knuckle span
+        // at that moment so the throw decision can compare absolute
+        // forward displacement (grew since grip) rather than an
+        // instantaneous velocity, which was prone to firing on wind-up
+        // jitter.
+        private var wasGripped: Bool = false
+        private var gripStartSize: Float = 0
         private var peakSpeed: Float = 0
-        // Peak rate at which the knuckle span has been growing recently.
-        // Only forward (toward-camera) motion contributes — pulling back
-        // to wind up shrinks the span and is excluded from this peak.
-        private var peakForwardSpeed: Float = 0
         private var smoothedSize: Float = 0
         private var prevPalm = SIMD2<Float>(0.5, 0.5)
         private var lastTime: TimeInterval = 0
+        private var frameCounter: Int = 0
+        // Counts consecutive frames where totalPress is above the grip
+        // threshold. wasGripped only latches after a sustained run, so
+        // brief detection blips when the hand enters frame don't get
+        // mistaken for a deliberate grip-release.
+        private var gripStableFrames: Int = 0
+        // 3-sample buffer for palm-speed median filter. Vision joint
+        // estimates can teleport when the wrist flexes far enough that
+        // MCPs partially disappear, producing single-frame palm-speed
+        // spikes of 10+/sec that aren't real motion. Median(3) rejects
+        // any single-frame spike — sustained motion (real throws) gets
+        // through unchanged because at least 2 of 3 samples are high.
+        private var recentPalmSpeeds: [Float] = []
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
+            if lastTime == 0 {
+                Self.resetDebugLog()
+                Self.debugLog("--- new run, sensitivity=\(ThrowSensitivity.current.rawValue) thresh=\(ThrowSensitivity.current.forwardThreshold) ---")
+            }
             let dt = lastTime > 0 ? Float(min(0.05, time - lastTime)) : 1.0 / 60.0
             lastTime = time
 
@@ -1334,43 +1673,91 @@ struct OrbSceneView: NSViewRepresentable {
             }
             smoothedRoll += (targetRoll - smoothedRoll) * 0.3
             smoothedPresence += (presenceTarget - smoothedPresence) * 0.2
-            let prevSize = smoothedSize
             smoothedSize += (targetSize - smoothedSize) * 0.4
 
             let totalPress = smoothedStrengths.reduce(0, +)
             let palm = (smoothedTips.reduce(SIMD2<Float>.zero, +)) / 5
             let palmDelta = palm - prevPalm
             let palmSpeed = sqrt(palmDelta.x * palmDelta.x + palmDelta.y * palmDelta.y) / max(dt, 1e-3)
-            // Positive when knuckle span is growing (hand moving toward
-            // camera), negative when shrinking (winding up / pulling back).
-            let sizeVelocity = (smoothedSize - prevSize) / max(dt, 1e-3)
 
-            // Decay peaks ~5%/frame and ~8%/frame so a high value sticks
-            // around for ~1 second after the moment we saw it.
-            peakPress = max(peakPress * 0.95, totalPress)
-            peakSpeed = max(peakSpeed * 0.92, palmSpeed)
-            peakForwardSpeed = max(peakForwardSpeed * 0.92, max(0, sizeVelocity))
+            // Median-filter palmSpeed over a 3-frame window before
+            // feeding it into peakSpeed — kills single-frame Vision
+            // teleports without dampening real sustained motion.
+            recentPalmSpeeds.append(palmSpeed)
+            if recentPalmSpeeds.count > 3 { recentPalmSpeeds.removeFirst() }
+            let medianPalmSpeed: Float = {
+                let sorted = recentPalmSpeeds.sorted()
+                return sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+            }()
+
+            // Decay the palm-speed peak ~8%/frame so a high value sticks
+            // around for ~1 second after the moment we saw it. Used to
+            // size the spin once a throw fires, since by the time we
+            // detect "enough forward displacement" the hand may already
+            // be slowing.
+            peakSpeed = max(peakSpeed * 0.92, medianPalmSpeed)
 
             switch dieState {
             case .tracking:
-                let target = simd_quatf(angle: -smoothedRoll, axis: SIMD3<Float>(0, 0, 1))
-                dieOrientation = simd_slerp(dieOrientation, target,
-                                             min(1, dt * 8))
+                // Only let the die track hand roll once a real grip
+                // has latched. Otherwise an ungripped hand passing
+                // through frame visibly wobbles the die — fine for a
+                // 20-face icosahedron whose geometry is uniform, but
+                // a cube broadcasts every rotation and reads as
+                // "the die got hit."
+                if wasGripped {
+                    let target = simd_quatf(angle: -smoothedRoll, axis: SIMD3<Float>(0, 0, 1))
+                    dieOrientation = simd_slerp(dieOrientation, target,
+                                                 min(1, dt * 8))
+                }
 
-                // Throw: gripped at some point in the last ~second and
-                // hand is now open. Velocity isn't required — opening
-                // the fist is enough to roll the die — but if there was
-                // motion it scales the spin speed up.
-                let releasedFromGrip = peakPress > 1.2 && totalPress < 0.5
-                // Require forward motion (knuckle span growing — hand
-                // moving toward the camera) during the release. A wind-up
-                // pulls the hand back, shrinking the span, so it doesn't
-                // contribute to peakForwardSpeed and won't trigger a roll.
-                let hasForwardMotion = peakForwardSpeed > 0.25
-                if releasedFromGrip && hasForwardMotion {
-                    let throwSpeed = max(palmSpeed, peakSpeed)
-                    let baseSpeed: Float = 16
-                    let speed = max(baseSpeed, min(50, throwSpeed * 10))
+                // Track sustained grip: only latch wasGripped after the
+                // grip threshold has been crossed for ~100ms. Brief
+                // hand-enters-frame blips (where smoothing transiently
+                // pushes totalPress > 1.2 for 1-2 frames) don't count.
+                if totalPress > 1.2 {
+                    gripStableFrames += 1
+                } else {
+                    gripStableFrames = 0
+                }
+                let prevGripped = wasGripped
+                if gripStableFrames >= 6 { wasGripped = true }  // ~100ms at 60fps
+                if !prevGripped && wasGripped {
+                    gripStartSize = smoothedSize
+                    peakSpeed = 0
+                    Self.debugLog(String(format: "GRIP_LATCH press=%.2f size=%.4f stableFrames=\(gripStableFrames)",
+                                         totalPress, smoothedSize))
+                }
+
+                // Two independent fire paths:
+                //   Path A — slow deliberate throw: knuckle-span grew
+                //   forward by an absolute amount, and the hand was at
+                //   least moving (peakSpd > 0.5 rejects pure jitter).
+                //   Path B — fast lateral or off-screen throw: peak
+                //   palm speed crossed a high threshold while the hand
+                //   wasn't notably moving backward. This catches the
+                //   cases where the hand exits frame or rotates such
+                //   that knuckle span barely changes.
+                // A pull-back wind-up has notably negative growth and
+                // is rejected by both paths.
+                let growthThreshold = ThrowSensitivity.current.forwardThreshold
+                let speedThreshold  = ThrowSensitivity.current.peakSpeedThreshold
+                let forwardGrowth   = smoothedSize - gripStartSize
+                let pathA = forwardGrowth > growthThreshold && peakSpeed > 0.5
+                let pathB = peakSpeed > speedThreshold && forwardGrowth > -0.005
+
+                if wasGripped && (pathA || pathB) {
+                    // Use the median-filtered palm speed for the spin
+                    // amount too — otherwise a single-frame Vision
+                    // teleport at the fire instant overshoots the cap
+                    // and produces a faster spin than the real motion.
+                    let throwSpeed = max(medianPalmSpeed, peakSpeed)
+                    // Total visible rotation ≈ speed / decay. With
+                    // base 35 and decay 2.2 a baseline throw lands
+                    // ~2.5 rotations; fast throws (peakSpd 5+) push
+                    // toward 4-6 rotations before the cap.
+                    let baseSpeed: Float = 35
+                    let speed = max(baseSpeed, min(80, throwSpeed * 14))
                     let tumble = SIMD3<Float>(
                         Float.random(in: -1...1),
                         Float.random(in: -1...1),
@@ -1384,13 +1771,50 @@ struct OrbSceneView: NSViewRepresentable {
                     let rawLen = sqrt(raw.x * raw.x + raw.y * raw.y + raw.z * raw.z)
                     let axis = rawLen > 0.001 ? raw / rawLen : SIMD3<Float>(1, 0, 0)
                     angularVelocity = axis * speed
-                    rolledFace = Int.random(in: 1...DieKind.current.faceCount)
+                    rolledFace = Self.randomFaceExcluding(
+                        OrbSceneView.nearestFace(to: dieOrientation))
                     dieResult = nil
                     dieState = .spinning
-                    peakPress = 0
+                    let firePath = pathA ? "A_growth" : "B_speed"
+                    Self.debugLog(String(format: "FIRE path=\(firePath) growth=%.4f peakSpd=%.2f throwSpd=%.2f",
+                                         forwardGrowth, peakSpeed, throwSpeed))
+                    wasGripped = false
                     peakSpeed = 0
-                    peakForwardSpeed = 0
                     camera?.appendGameMessage("YOU ROLLED THE DIE")
+                } else if wasGripped && totalPress < 0.5 {
+                    // Released without a qualifying throw — gentle
+                    // roll: pick a random face and quickly tumble to
+                    // it. Lower starting angular velocity so the spin
+                    // visibly differs from a "real" thrown roll, but
+                    // still produces a fresh result every grip-release.
+                    let face = Self.randomFaceExcluding(
+                        OrbSceneView.nearestFace(to: dieOrientation))
+                    let tumble = SIMD3<Float>(
+                        Float.random(in: -1...1),
+                        Float.random(in: -1...1),
+                        Float.random(in: -0.4...0.4)
+                    )
+                    let tlen = sqrt(tumble.x * tumble.x + tumble.y * tumble.y + tumble.z * tumble.z)
+                    let axis = tlen > 0.001 ? tumble / tlen : SIMD3<Float>(1, 0, 0)
+                    angularVelocity = axis * 24
+                    rolledFace = face
+                    dieResult = nil
+                    dieState = .spinning
+                    let reason = (smoothedPresence < 0.5) ? "exited_frame" : "opened_hand"
+                    Self.debugLog(String(format: "SETTLE reason=\(reason) growth=%.4f peakSpd=%.2f face=\(face)",
+                                         forwardGrowth, peakSpeed))
+                    camera?.appendGameMessage("YOU ROLLED THE DIE")
+                    wasGripped = false
+                    peakSpeed = 0
+                } else if wasGripped && frameCounter % 3 == 0 {
+                    // Heartbeat while gripped — captures the actual
+                    // motion timeline so we can see why a throw didn't
+                    // fire.
+                    Self.debugLog(String(
+                        format: "GRIP press=%.2f size=%.4f growth=%+.4f/%.3f palmSpd=%.2f peakSpd=%.2f pres=%.2f",
+                        totalPress, smoothedSize, forwardGrowth, growthThreshold,
+                        palmSpeed, peakSpeed, smoothedPresence
+                    ))
                 }
             case .spinning:
                 let speed = sqrt(angularVelocity.x * angularVelocity.x
@@ -1400,14 +1824,14 @@ struct OrbSceneView: NSViewRepresentable {
                     let axis = angularVelocity / speed
                     let dq = simd_quatf(angle: speed * dt, axis: axis)
                     dieOrientation = simd_mul(dq, dieOrientation)
-                    angularVelocity *= exp(-1.0 * dt)
+                    angularVelocity *= exp(-2.2 * dt)
 
-                    // Below ~5 rad/s, blend toward the pre-picked target
+                    // Below ~3 rad/s, blend toward the pre-picked target
                     // orientation so the spin glides smoothly into the
                     // chosen face without a visible snap.
-                    if let face = rolledFace, speed < 5 {
+                    if let face = rolledFace, speed < 3 {
                         let target = OrbSceneView.orientationFor(faceNumber: face)
-                        let approach = (5 - speed) / 5
+                        let approach = (3 - speed) / 3
                         let step = min(1, approach * dt * 6)
                         dieOrientation = simd_slerp(dieOrientation, target, step)
                     }
@@ -1425,13 +1849,46 @@ struct OrbSceneView: NSViewRepresentable {
                 if totalPress > 1.2 {
                     dieResult = nil
                     dieState = .tracking
-                    peakPress = 0
+                    wasGripped = false
                     peakSpeed = 0
-                    peakForwardSpeed = 0
+                    gripStableFrames = 0
                 }
             }
 
             prevPalm = palm
+            frameCounter += 1
+
+            // Publish a live debug readout to the camera-view HUD every
+            // 4 frames (~15 Hz) — fast enough to feel live, slow enough
+            // to keep the UI cheap.
+            if frameCounter % 4 == 0 {
+                let growthThreshold = ThrowSensitivity.current.forwardThreshold
+                let forwardGrowth = smoothedSize - gripStartSize
+                let stateName: String = {
+                    switch dieState {
+                    case .tracking: return "track"
+                    case .spinning: return "spin"
+                    case .settled:  return "settle"
+                    }
+                }()
+                let dbg = String(
+                    format: """
+                    state:  %@
+                    grip:   %@   press: %.2f
+                    size:   %.4f   start: %.4f
+                    growth: %+.4f / %.3f
+                    palm:   %.2f   peak: %.2f / 0.50
+                    pres:   %.2f
+                    """,
+                    stateName,
+                    wasGripped ? "Y" : "N", totalPress,
+                    smoothedSize, gripStartSize,
+                    forwardGrowth, growthThreshold,
+                    palmSpeed, peakSpeed,
+                    smoothedPresence
+                )
+                camera?.updateDebugText(dbg)
+            }
 
             let snap = OrbSnapshot(
                 roll: smoothedRoll,
