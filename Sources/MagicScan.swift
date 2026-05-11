@@ -22,6 +22,15 @@ struct MagicScanApp: App {
                 .frame(minWidth: 320, minHeight: 320)
         }
         .defaultSize(width: 480, height: 480)
+        // Without this, AppKit auto-opens the Die Roller window at
+        // launch. In Adventure mode OrbView dismisses itself in
+        // onAppear, but the OrbSceneView's Coordinator has already
+        // spun up by then and stays alive in parallel with the
+        // EmbeddedOrbView's Coordinator — every throw fires twice
+        // with two different face numbers. Suppressing the auto-open
+        // means the window only exists when openWindow is called
+        // (Casino mode), so there's exactly one live Coordinator.
+        .defaultLaunchBehavior(.suppressed)
 
         Settings {
             SettingsView()
@@ -117,10 +126,27 @@ enum ThrowSensitivity: String, CaseIterable, Identifiable {
     }
 }
 
+enum AdventureControls: String, CaseIterable, Identifiable {
+    case click, arrows
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .click:  return "Click to move"
+        case .arrows: return "Arrow keys"
+        }
+    }
+    static let storageKey = "adventureControls"
+    static var current: AdventureControls {
+        let raw = UserDefaults.standard.string(forKey: storageKey) ?? ""
+        return AdventureControls(rawValue: raw) ?? .click
+    }
+}
+
 struct SettingsView: View {
     @AppStorage(HandPreference.storageKey) private var preferred: String = HandPreference.right.rawValue
     @AppStorage(DieKind.storageKey) private var die: String = DieKind.d6.rawValue
     @AppStorage(ThrowSensitivity.storageKey) private var sensitivity: String = ThrowSensitivity.normal.rawValue
+    @AppStorage(AdventureControls.storageKey) private var controls: String = AdventureControls.click.rawValue
 
     var body: some View {
         Form {
@@ -144,6 +170,13 @@ struct SettingsView: View {
                 }
             }
             .pickerStyle(.segmented)
+
+            Picker("Adventure controls", selection: $controls) {
+                ForEach(AdventureControls.allCases) { c in
+                    Text(c.label).tag(c.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
         }
         .padding(20)
         .frame(width: 360)
@@ -153,21 +186,48 @@ struct SettingsView: View {
 struct ContentView: View {
     @EnvironmentObject var camera: CameraController
     @AppStorage(DieKind.storageKey) private var dieKind: String = DieKind.d6.rawValue
+    @AppStorage(AdventureControls.storageKey) private var adventureControls: String = AdventureControls.click.rawValue
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
+    @State private var dungeonMap = DungeonMap.make(floor: 1)
+    @FocusState private var keyboardFocused: Bool
+
+    private var arrowMode: Bool {
+        dieKind == DieKind.d20.rawValue
+            && adventureControls == AdventureControls.arrows.rawValue
+    }
+
+    /// True iff the player is standing on an enemy tile. The embedded
+    /// die only appears in this state — combat is the only thing you
+    /// roll for in Adventure mode right now.
+    private var isOnEnemyTile: Bool {
+        let r = dungeonMap.playerRow, c = dungeonMap.playerCol
+        return dungeonMap.tiles[r][c].kind == .enemy
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             if dieKind == DieKind.d20.rawValue {
                 HStack(spacing: 0) {
-                    cameraPreview(embedOrb: true)
-                    DungeonMapView { camera.appendGameMessage($0) }
+                    dungeonView3D()
+                    DungeonMapView(map: $dungeonMap) {
+                        camera.appendGameMessage($0)
+                    }
                 }
                 GameTextBox(messages: camera.gameMessages)
             } else {
-                cameraPreview(embedOrb: false)
+                cameraPreview()
             }
         }
+        .focusable(arrowMode)
+        .focusEffectDisabled()
+        .focused($keyboardFocused)
+        .onKeyPress(.upArrow)    { handleArrow(.up) }
+        .onKeyPress(.downArrow)  { handleArrow(.down) }
+        .onKeyPress(.leftArrow)  { handleArrow(.left) }
+        .onKeyPress(.rightArrow) { handleArrow(.right) }
+        .onKeyPress(.space)      { handleInteract() }
+        .onKeyPress(.return)     { handleInteract() }
         .onAppear {
             camera.start()
             // Only open the standalone die-roller window in Casino
@@ -175,18 +235,95 @@ struct ContentView: View {
             if dieKind == DieKind.d6.rawValue {
                 openWindow(id: "orb")
             }
+            if arrowMode { keyboardFocused = true }
         }
         .onChange(of: dieKind) { newValue in
             if newValue == DieKind.d20.rawValue {
                 dismissWindow(id: "orb")
+                if arrowMode { keyboardFocused = true }
             } else {
                 openWindow(id: "orb")
             }
         }
+        .onChange(of: adventureControls) { _ in
+            if arrowMode { keyboardFocused = true }
+        }
     }
 
-    private func cameraPreview(embedOrb: Bool) -> some View {
-        CameraPreview(session: camera.session, hands: camera.hands)
+    private enum ArrowDir { case up, down, left, right }
+
+    private func handleArrow(_ dir: ArrowDir) -> KeyPress.Result {
+        guard arrowMode else { return .ignored }
+        switch dir {
+        case .up:    logStep(dungeonMap.step(forward: true))
+        case .down:  logStep(dungeonMap.step(forward: false))
+        case .left:  dungeonMap.turn(by: -1)
+        case .right: dungeonMap.turn(by: 1)
+        }
+        return .handled
+    }
+
+    private func handleInteract() -> KeyPress.Result {
+        guard arrowMode else { return .ignored }
+        let r = dungeonMap.playerRow, c = dungeonMap.playerCol
+        guard dungeonMap.tiles[r][c].kind == .door else { return .ignored }
+        dungeonMap = DungeonMap.make(floor: dungeonMap.floor + 1)
+        camera.appendGameMessage("You descend to floor \(dungeonMap.floor).")
+        return .handled
+    }
+
+    private func logStep(_ kind: DungeonTileKind?) {
+        guard let kind else { return }
+        switch kind {
+        case .empty: camera.appendGameMessage("You step into an empty space.")
+        case .chest: camera.appendGameMessage("You find a treasure chest.")
+        case .enemy: camera.appendGameMessage("You spot an enemy.")
+        case .door:  camera.appendGameMessage("You find a door leading down. Press space to descend.")
+        }
+    }
+
+    private func cameraPreview() -> some View {
+        standardOverlays(
+            CameraPreview(session: camera.session, hands: camera.hands),
+            embedOrb: false
+        )
+    }
+
+    private func dungeonView3D() -> some View {
+        standardOverlays(
+            DungeonView3D(map: dungeonMap),
+            embedOrb: isOnEnemyTile
+        )
+        .overlay(alignment: .bottomLeading) {
+            // Hide the on-screen turn buttons in arrow-keys mode —
+            // ←/→ already do the same thing, and the click-style
+            // affordances would be misleading.
+            if !arrowMode {
+                HStack(spacing: 12) {
+                    turnButton("◀") { dungeonMap.turn(by: -1) }
+                    turnButton("▶") { dungeonMap.turn(by: 1) }
+                }
+                .padding(24)
+            }
+        }
+    }
+
+    private func turnButton(_ glyph: String,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(glyph)
+                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                .foregroundColor(.white)
+                .frame(width: 48, height: 48)
+                .background(.black.opacity(0.55), in: Circle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func standardOverlays<Base: View>(_ base: Base,
+                                              embedOrb: Bool) -> some View {
+        base
             .overlay(alignment: .topLeading) {
                 VStack(alignment: .leading, spacing: 12) {
                     if camera.isRecording {
@@ -251,6 +388,13 @@ struct DungeonMap {
 
     var tiles: [[DungeonTile]]
     var floor: Int
+    /// Current player tile (row, col). Reachability is measured from
+    /// here, and the 3D camera is parked over this tile.
+    var playerRow: Int
+    var playerCol: Int
+    /// 0 = north (toward row 0), 1 = east, 2 = south, 3 = west.
+    /// Drives the 3D camera yaw and the player marker on the 2D map.
+    var playerFacing: Int
 
     static func make(floor: Int) -> DungeonMap {
         var grid: [[DungeonTile]] = (0..<rows).map { _ in
@@ -265,11 +409,14 @@ struct DungeonMap {
             let c = Int.random(in: 0..<columns)
             grid[r][c].kind = .door
         }
-        // Spawn point: center, forced empty and pre-revealed.
+        // Spawn point: center, forced empty and pre-revealed. Player
+        // starts here facing north.
         let sr = rows / 2, sc = columns / 2
         grid[sr][sc].kind = .empty
         grid[sr][sc].revealed = true
-        return DungeonMap(tiles: grid, floor: floor)
+        return DungeonMap(tiles: grid, floor: floor,
+                          playerRow: sr, playerCol: sc,
+                          playerFacing: 0)
     }
 
     private static func randomKind() -> DungeonTileKind {
@@ -281,29 +428,78 @@ struct DungeonMap {
         }
     }
 
-    func canReveal(row: Int, col: Int) -> Bool {
+    /// True if (row, col) is one orthogonal step from the player and
+    /// in bounds. Defines both "tiles the player can step into" and
+    /// "tiles to highlight on the 3D floor."
+    func canMoveTo(row: Int, col: Int) -> Bool {
         guard row >= 0, row < Self.rows, col >= 0, col < Self.columns else { return false }
-        if tiles[row][col].revealed { return false }
-        for (dr, dc) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let nr = row + dr, nc = col + dc
-            if nr >= 0, nr < Self.rows, nc >= 0, nc < Self.columns,
-               tiles[nr][nc].revealed {
-                return true
-            }
-        }
-        return false
+        let dr = abs(row - playerRow)
+        let dc = abs(col - playerCol)
+        return (dr + dc) == 1
     }
 
-    mutating func reveal(row: Int, col: Int) -> DungeonTileKind? {
-        guard canReveal(row: row, col: col) else { return nil }
+    /// Move the player onto (row, col), auto-turning to face the
+    /// direction of travel. Returns the tile kind iff the destination
+    /// was newly revealed by the move (so callers can log the
+    /// discovery). Returns nil for no-op moves and for moves onto
+    /// already-revealed tiles.
+    mutating func step(toRow row: Int, col: Int) -> DungeonTileKind? {
+        guard canMoveTo(row: row, col: col) else { return nil }
+        if row < playerRow      { playerFacing = 0 }   // north
+        else if row > playerRow { playerFacing = 2 }   // south
+        else if col > playerCol { playerFacing = 1 }   // east
+        else                    { playerFacing = 3 }   // west
+        let wasRevealed = tiles[row][col].revealed
         tiles[row][col].revealed = true
-        return tiles[row][col].kind
+        playerRow = row
+        playerCol = col
+        return wasRevealed ? nil : tiles[row][col].kind
+    }
+
+    /// Rotate the player in place. `delta = +1` turns right (clockwise
+    /// from above), `-1` turns left.
+    mutating func turn(by delta: Int) {
+        playerFacing = ((playerFacing + delta) % 4 + 4) % 4
+    }
+
+    /// (dr, dc) for the tile one square forward of the player. Used by
+    /// arrow-key controls.
+    private func forwardOffset() -> (dr: Int, dc: Int) {
+        switch playerFacing {
+        case 0:  return (-1, 0)   // north
+        case 1:  return (0, 1)    // east
+        case 2:  return (1, 0)    // south
+        case 3:  return (0, -1)   // west
+        default: return (0, 0)
+        }
+    }
+
+    /// Step one tile forward or backward along the current facing,
+    /// preserving facing. Returns the discovered tile kind iff the
+    /// destination was newly revealed.
+    mutating func step(forward: Bool) -> DungeonTileKind? {
+        let off = forwardOffset()
+        let dr = forward ? off.dr : -off.dr
+        let dc = forward ? off.dc : -off.dc
+        let r = playerRow + dr
+        let c = playerCol + dc
+        guard r >= 0, r < Self.rows, c >= 0, c < Self.columns else { return nil }
+        let wasRevealed = tiles[r][c].revealed
+        tiles[r][c].revealed = true
+        playerRow = r
+        playerCol = c
+        return wasRevealed ? nil : tiles[r][c].kind
     }
 }
 
 struct DungeonMapView: View {
-    @State private var map = DungeonMap.make(floor: 1)
+    @Binding var map: DungeonMap
+    @AppStorage(AdventureControls.storageKey) private var controls: String = AdventureControls.click.rawValue
     var log: (String) -> Void
+
+    private var clickToMove: Bool {
+        controls == AdventureControls.click.rawValue
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -344,33 +540,50 @@ struct DungeonMapView: View {
     @ViewBuilder
     private func tileView(row: Int, col: Int) -> some View {
         let tile = map.tiles[row][col]
-        let reachable = map.canReveal(row: row, col: col)
+        let isPlayer = (row == map.playerRow && col == map.playerCol)
+        let reachable = map.canMoveTo(row: row, col: col)
         Button {
             handleTap(row: row, col: col)
         } label: {
             ZStack {
-                Rectangle().fill(tileFill(tile: tile, reachable: reachable))
+                Rectangle().fill(tileFill(tile: tile,
+                                          isPlayer: isPlayer,
+                                          reachable: reachable))
                 if tile.revealed {
                     Text(glyph(for: tile.kind))
                         .font(.system(size: 18, weight: .bold, design: .monospaced))
                         .foregroundColor(glyphColor(for: tile.kind))
                 }
+                if isPlayer {
+                    Text(playerGlyph(facing: map.playerFacing))
+                        .font(.system(size: 18, weight: .black, design: .monospaced))
+                        .foregroundColor(Color(red: 1.0, green: 0.95, blue: 0.4))
+                }
             }
         }
         .buttonStyle(.plain)
-        .disabled(!tile.revealed && !reachable)
+        .disabled(!clickToMove || (!isPlayer && !reachable))
     }
 
     private func handleTap(row: Int, col: Int) {
-        let tile = map.tiles[row][col]
-        if tile.revealed {
-            if tile.kind == .door {
+        // In arrow-keys mode the 2D map is display-only — movement
+        // and descent happen via the keyboard.
+        guard clickToMove else { return }
+        let isPlayer = (row == map.playerRow && col == map.playerCol)
+        // Re-clicking your own tile: descend if it's a door, otherwise
+        // no-op.
+        if isPlayer {
+            if map.tiles[row][col].kind == .door {
                 map = DungeonMap.make(floor: map.floor + 1)
                 log("You descend to floor \(map.floor).")
             }
             return
         }
-        guard let kind = map.reveal(row: row, col: col) else { return }
+        guard map.canMoveTo(row: row, col: col) else { return }
+        let discovered = map.step(toRow: row, col: col)
+        // Already-revealed steps are silent — the visible movement is
+        // its own feedback. Only newly-revealed tiles log discovery.
+        guard let kind = discovered else { return }
         switch kind {
         case .empty: log("You step into an empty space.")
         case .chest: log("You find a treasure chest.")
@@ -379,9 +592,22 @@ struct DungeonMapView: View {
         }
     }
 
-    private func tileFill(tile: DungeonTile, reachable: Bool) -> Color {
+    private func tileFill(tile: DungeonTile,
+                          isPlayer: Bool,
+                          reachable: Bool) -> Color {
+        if isPlayer { return Color(red: 0.0, green: 0.45, blue: 0.55) }
         if tile.revealed { return Color(white: 0.28) }
         return reachable ? Color(white: 0.22) : Color(white: 0.10)
+    }
+
+    private func playerGlyph(facing: Int) -> String {
+        switch facing {
+        case 0:  return "▲"
+        case 1:  return "▶"
+        case 2:  return "▼"
+        case 3:  return "◀"
+        default: return "●"
+        }
     }
 
     private func glyph(for kind: DungeonTileKind) -> String {
@@ -400,6 +626,320 @@ struct DungeonMapView: View {
         case .enemy: return Color(red: 0.92, green: 0.32, blue: 0.32)
         case .door:  return Color(red: 0.40, green: 0.78, blue: 0.95)
         }
+    }
+}
+
+/// First-person Tron-style wireframe view of the dungeon. The character
+/// stands on the spawn tile (center of the map) facing toward row 0;
+/// revealed tiles render as a neon-green wireframe floor, unknown tiles
+/// rise up as neon-blue fog pillars, and revealed contents (chests,
+/// enemies, doors) get stylized wireframe markers. The view rebuilds
+/// whenever the dungeon map changes.
+struct DungeonView3D: NSViewRepresentable {
+    let map: DungeonMap
+
+    /// Tracks the camera's unwrapped yaw and last-known map state so
+    /// rotations always take the shortest signed path (and so floor
+    /// changes can snap rather than animate across the whole map).
+    final class Coordinator {
+        var cameraYaw: Float = 0
+        var lastFacing: Int = 0
+        var lastFloor: Int = -1
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> SCNView {
+        let view = SCNView()
+        view.backgroundColor = NSColor.black
+        view.antialiasingMode = .multisampling4X
+        view.allowsCameraControl = false
+        view.isPlaying = true
+        view.rendersContinuously = false
+
+        let scene = SCNScene()
+        scene.background.contents = NSColor.black
+
+        // First-person camera. Position and yaw are set in
+        // updateCamera so they can track the player tile-by-tile; here
+        // we just install the node with a fixed pitch and FOV.
+        let camNode = SCNNode()
+        camNode.name = Self.cameraTag
+        let cam = SCNCamera()
+        cam.fieldOfView = 68
+        cam.zNear = 0.05
+        cam.zFar = 60
+        camNode.camera = cam
+        // Pitch ~9° downward so the floor in front is visible without
+        // hiding the horizon.
+        camNode.eulerAngles = SCNVector3(-0.16, 0, 0)
+        scene.rootNode.addChildNode(camNode)
+
+        view.scene = scene
+        Self.updateCamera(in: scene, map: map, coord: context.coordinator,
+                           animated: false)
+        Self.rebuildContent(in: scene, map: map)
+        return view
+    }
+
+    func updateNSView(_ nsView: SCNView, context: Context) {
+        guard let scene = nsView.scene else { return }
+        Self.updateCamera(in: scene, map: map, coord: context.coordinator,
+                           animated: true)
+        Self.rebuildContent(in: scene, map: map)
+    }
+
+    private static let contentTag = "dungeon-content"
+    private static let cameraTag = "dungeon-camera"
+
+    /// Snap or animate the camera to (playerCol, playerRow) with a yaw
+    /// matching playerFacing. Uses an *unwrapped* yaw so successive
+    /// turns rotate the short way each time instead of unwinding
+    /// through 0.
+    private static func updateCamera(in scene: SCNScene,
+                                     map: DungeonMap,
+                                     coord: Coordinator,
+                                     animated: Bool) {
+        guard let camNode = scene.rootNode.childNode(withName: cameraTag,
+                                                      recursively: false) else { return }
+        let cols = DungeonMap.columns
+        let rows = DungeonMap.rows
+        let cx = Float(cols) / 2
+        let cz = Float(rows) / 2
+        let px = Float(map.playerCol) - cx
+        let pz = Float(map.playerRow) - cz
+
+        let floorChanged = map.floor != coord.lastFloor
+        if floorChanged {
+            // New floor: snap everything (camera teleports across the
+            // map and resets facing). Animating that looks wrong.
+            coord.cameraYaw = Float(map.playerFacing) * (-.pi / 2)
+            coord.lastFacing = map.playerFacing
+            coord.lastFloor = map.floor
+        } else {
+            // Choose the signed delta that takes the short path
+            // through the facing wheel (3 → 0 should be +1, not -3).
+            var delta = map.playerFacing - coord.lastFacing
+            if delta == 3 { delta = -1 }
+            else if delta == -3 { delta = 1 }
+            coord.cameraYaw += Float(delta) * (-.pi / 2)
+            coord.lastFacing = map.playerFacing
+        }
+
+        let shouldAnimate = animated && !floorChanged
+        if shouldAnimate {
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.22
+        }
+        camNode.position = SCNVector3(px, 0.55, pz)
+        camNode.eulerAngles = SCNVector3(-0.16, coord.cameraYaw, 0)
+        if shouldAnimate {
+            SCNTransaction.commit()
+        }
+    }
+
+    private static func rebuildContent(in scene: SCNScene, map: DungeonMap) {
+        // Clear previous wireframe pass.
+        scene.rootNode.childNodes
+            .filter { $0.name == contentTag }
+            .forEach { $0.removeFromParentNode() }
+
+        let cols = DungeonMap.columns
+        let rows = DungeonMap.rows
+        let cx = Float(cols) / 2
+        let cz = Float(rows) / 2
+
+        func tileCenter(row: Int, col: Int) -> SIMD3<Float> {
+            // Row 0 maps to -cz (far ahead of player when facing
+            // north). World origin (0,0,0) is the geometric center of
+            // the map; the camera moves to track the player tile.
+            SIMD3<Float>(Float(col) - cx, 0, Float(row) - cz)
+        }
+
+        var floorSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        var wallSegs:  [(SIMD3<Float>, SIMD3<Float>)] = []
+        var chestSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        var enemySegs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        var doorSegs:  [(SIMD3<Float>, SIMD3<Float>)] = []
+
+        for r in 0..<rows {
+            for c in 0..<cols {
+                let tile = map.tiles[r][c]
+                let revealed = tile.revealed
+                let reachable = map.canMoveTo(row: r, col: c)
+                let p = tileCenter(row: r, col: c)
+
+                if revealed || reachable {
+                    // Floor tile outline.
+                    let h: Float = 0.5
+                    let a = SIMD3<Float>(p.x - h, 0, p.z - h)
+                    let b = SIMD3<Float>(p.x + h, 0, p.z - h)
+                    let cc = SIMD3<Float>(p.x + h, 0, p.z + h)
+                    let d = SIMD3<Float>(p.x - h, 0, p.z + h)
+                    floorSegs.append((a, b))
+                    floorSegs.append((b, cc))
+                    floorSegs.append((cc, d))
+                    floorSegs.append((d, a))
+                } else {
+                    // Unknown region: wireframe fog pillar.
+                    addBoxEdges(to: &wallSegs,
+                                 center: SIMD3<Float>(p.x, 0.6, p.z),
+                                 size: SIMD3<Float>(0.94, 1.2, 0.94))
+                }
+
+                guard revealed else { continue }
+                switch tile.kind {
+                case .empty:
+                    break
+                case .chest:
+                    addBoxEdges(to: &chestSegs,
+                                 center: SIMD3<Float>(p.x, 0.18, p.z),
+                                 size: SIMD3<Float>(0.52, 0.36, 0.4))
+                case .enemy:
+                    addPyramidEdges(to: &enemySegs, base: p,
+                                     baseSize: 0.52, height: 0.7)
+                case .door:
+                    addDoorEdges(to: &doorSegs, base: p)
+                }
+            }
+        }
+
+        let floorColor = NSColor(calibratedRed: 0.20, green: 1.00, blue: 0.50, alpha: 1)
+        let wallColor  = NSColor(calibratedRed: 0.25, green: 0.55, blue: 1.00, alpha: 1)
+        let chestColor = NSColor(calibratedRed: 0.65, green: 1.00, blue: 0.30, alpha: 1)
+        let enemyColor = NSColor(calibratedRed: 0.00, green: 0.95, blue: 1.00, alpha: 1)
+        let doorColor  = NSColor(calibratedRed: 0.45, green: 0.80, blue: 1.00, alpha: 1)
+
+        for (segs, color) in [
+            (floorSegs, floorColor),
+            (wallSegs,  wallColor),
+            (chestSegs, chestColor),
+            (enemySegs, enemyColor),
+            (doorSegs,  doorColor),
+        ] {
+            guard let geom = buildLineGeometry(segments: segs, color: color) else { continue }
+            let node = SCNNode(geometry: geom)
+            node.name = contentTag
+            scene.rootNode.addChildNode(node)
+        }
+    }
+
+    // MARK: - Wireframe geometry helpers
+
+    /// Build a `.line`-primitive SCNGeometry over a list of segment pairs.
+    /// Returns nil when there's nothing to draw so callers can skip
+    /// adding a useless node.
+    private static func buildLineGeometry(
+        segments: [(SIMD3<Float>, SIMD3<Float>)],
+        color: NSColor
+    ) -> SCNGeometry? {
+        guard !segments.isEmpty else { return nil }
+        var verts: [SIMD3<Float>] = []
+        verts.reserveCapacity(segments.count * 2)
+        var indices: [Int32] = []
+        indices.reserveCapacity(segments.count * 2)
+        for seg in segments {
+            indices.append(Int32(verts.count))
+            verts.append(seg.0)
+            indices.append(Int32(verts.count))
+            verts.append(seg.1)
+        }
+        let vertData = Data(bytes: verts,
+                             count: MemoryLayout<SIMD3<Float>>.stride * verts.count)
+        let src = SCNGeometrySource(
+            data: vertData, semantic: .vertex,
+            vectorCount: verts.count,
+            usesFloatComponents: true,
+            componentsPerVector: 3,
+            bytesPerComponent: MemoryLayout<Float>.size,
+            dataOffset: 0,
+            dataStride: MemoryLayout<SIMD3<Float>>.stride)
+
+        let idxData = Data(bytes: indices,
+                            count: MemoryLayout<Int32>.size * indices.count)
+        let element = SCNGeometryElement(
+            data: idxData,
+            primitiveType: .line,
+            primitiveCount: indices.count / 2,
+            bytesPerIndex: MemoryLayout<Int32>.size)
+
+        let geom = SCNGeometry(sources: [src], elements: [element])
+        let m = SCNMaterial()
+        m.lightingModel = .constant
+        m.diffuse.contents = color
+        m.emission.contents = color
+        m.isDoubleSided = true
+        m.writesToDepthBuffer = false
+        geom.firstMaterial = m
+        return geom
+    }
+
+    private static func addBoxEdges(
+        to segments: inout [(SIMD3<Float>, SIMD3<Float>)],
+        center: SIMD3<Float>, size: SIMD3<Float>
+    ) {
+        let hx = size.x / 2, hy = size.y / 2, hz = size.z / 2
+        let c = center
+        let corners: [SIMD3<Float>] = [
+            SIMD3(c.x - hx, c.y - hy, c.z - hz),  // 0
+            SIMD3(c.x + hx, c.y - hy, c.z - hz),  // 1
+            SIMD3(c.x + hx, c.y - hy, c.z + hz),  // 2
+            SIMD3(c.x - hx, c.y - hy, c.z + hz),  // 3
+            SIMD3(c.x - hx, c.y + hy, c.z - hz),  // 4
+            SIMD3(c.x + hx, c.y + hy, c.z - hz),  // 5
+            SIMD3(c.x + hx, c.y + hy, c.z + hz),  // 6
+            SIMD3(c.x - hx, c.y + hy, c.z + hz),  // 7
+        ]
+        let edges: [(Int, Int)] = [
+            (0, 1), (1, 2), (2, 3), (3, 0),  // bottom rect
+            (4, 5), (5, 6), (6, 7), (7, 4),  // top rect
+            (0, 4), (1, 5), (2, 6), (3, 7),  // verticals
+        ]
+        for (a, b) in edges {
+            segments.append((corners[a], corners[b]))
+        }
+    }
+
+    private static func addPyramidEdges(
+        to segments: inout [(SIMD3<Float>, SIMD3<Float>)],
+        base: SIMD3<Float>, baseSize: Float, height: Float
+    ) {
+        let h = baseSize / 2
+        let p0 = SIMD3<Float>(base.x - h, base.y, base.z - h)
+        let p1 = SIMD3<Float>(base.x + h, base.y, base.z - h)
+        let p2 = SIMD3<Float>(base.x + h, base.y, base.z + h)
+        let p3 = SIMD3<Float>(base.x - h, base.y, base.z + h)
+        let tip = SIMD3<Float>(base.x, base.y + height, base.z)
+        segments.append((p0, p1))
+        segments.append((p1, p2))
+        segments.append((p2, p3))
+        segments.append((p3, p0))
+        segments.append((p0, tip))
+        segments.append((p1, tip))
+        segments.append((p2, tip))
+        segments.append((p3, tip))
+    }
+
+    /// Door = tall portal frame at the tile center with a crossed
+    /// inner brace, facing the +Z / -Z axis. Reads as a "way through"
+    /// even at a glance.
+    private static func addDoorEdges(
+        to segments: inout [(SIMD3<Float>, SIMD3<Float>)],
+        base: SIMD3<Float>
+    ) {
+        let halfW: Float = 0.32
+        let height: Float = 1.05
+        let yBase = base.y
+        let yTop  = yBase + height
+        let p0 = SIMD3<Float>(base.x - halfW, yBase, base.z)
+        let p1 = SIMD3<Float>(base.x + halfW, yBase, base.z)
+        let p2 = SIMD3<Float>(base.x + halfW, yTop,  base.z)
+        let p3 = SIMD3<Float>(base.x - halfW, yTop,  base.z)
+        segments.append((p0, p3))   // left jamb
+        segments.append((p1, p2))   // right jamb
+        segments.append((p3, p2))   // lintel
+        segments.append((p0, p2))   // diagonal
+        segments.append((p1, p3))   // diagonal
     }
 }
 
