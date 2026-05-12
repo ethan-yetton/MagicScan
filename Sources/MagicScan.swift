@@ -15,6 +15,15 @@ struct MagicScanApp: App {
                 .environmentObject(camera)
                 .frame(minWidth: 640, minHeight: 480)
         }
+        .commands {
+            CommandGroup(after: .newItem) {
+                Divider()
+                Button(camera.isRecording ? "Stop Recording" : "Start Recording") {
+                    camera.toggleRecording()
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+            }
+        }
 
         Window("Die Roller", id: "orb") {
             OrbView()
@@ -190,6 +199,7 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
     @State private var dungeonMap = DungeonMap.make(floor: 1)
+    @State private var shakingDie = false
     @FocusState private var keyboardFocused: Bool
 
     private var arrowMode: Bool {
@@ -226,12 +236,19 @@ struct ContentView: View {
         .onKeyPress(.downArrow)  { handleArrow(.down) }
         .onKeyPress(.leftArrow)  { handleArrow(.left) }
         .onKeyPress(.rightArrow) { handleArrow(.right) }
-        .onKeyPress(.space)      { handleInteract() }
+        .onKeyPress(.space, phases: [.down, .up]) { handleSpace($0.phase) }
         .onKeyPress(.return)     { handleInteract() }
+        // If the player moves off an enemy tile mid-shake (e.g.,
+        // arrow key while holding space), drop the shake state so a
+        // future enemy tile doesn't think we're still mid-press.
+        .onChange(of: isOnEnemyTile) { newValue in
+            if !newValue { shakingDie = false }
+        }
         .onAppear {
-            camera.start()
-            // Only open the standalone die-roller window in Casino
-            // mode. Adventure mode embeds the die in the main window.
+            // The camera is acquired by individual views that need it
+            // (CameraPreview / OrbView / EmbeddedOrbView) — no global
+            // startup here, so the camera stays off until the
+            // die-roll screen actually appears.
             if dieKind == DieKind.d6.rawValue {
                 openWindow(id: "orb")
             }
@@ -272,6 +289,23 @@ struct ContentView: View {
         return .handled
     }
 
+    /// Spacebar has two jobs in Adventure mode: drive the die roll
+    /// (hold to shake, release to throw) when standing on an enemy
+    /// tile, otherwise fall back to the existing arrow-mode descend
+    /// behavior on doors. Always clears `shakingDie` on .up so a
+    /// release outside the enemy context can't leave it stuck.
+    private func handleSpace(_ phase: KeyPress.Phases) -> KeyPress.Result {
+        let down = phase.contains(.down)
+        let up = phase.contains(.up)
+        if up { shakingDie = false }
+        if isOnEnemyTile {
+            if down { shakingDie = true }
+            return .handled
+        }
+        if down { return handleInteract() }
+        return .ignored
+    }
+
     private func logStep(_ kind: DungeonTileKind?) {
         guard let kind else { return }
         switch kind {
@@ -287,6 +321,8 @@ struct ContentView: View {
             CameraPreview(session: camera.session, hands: camera.hands),
             embedOrb: false
         )
+        .onAppear { camera.acquire() }
+        .onDisappear { camera.release() }
     }
 
     private func dungeonView3D() -> some View {
@@ -337,7 +373,7 @@ struct ContentView: View {
                         .background(.black.opacity(0.6), in: Capsule())
                     }
                     if embedOrb {
-                        EmbeddedOrbView()
+                        EmbeddedOrbView(shaking: shakingDie)
                             .environmentObject(camera)
                             .frame(width: 180, height: 180)
                     }
@@ -354,21 +390,6 @@ struct ContentView: View {
                                     in: RoundedRectangle(cornerRadius: 6))
                         .padding(12)
                 }
-            }
-            .overlay(alignment: .bottomTrailing) {
-                Button { camera.toggleRecording() } label: {
-                    ZStack {
-                        Circle().fill(.black.opacity(0.6)).frame(width: 56, height: 56)
-                        if camera.isRecording {
-                            RoundedRectangle(cornerRadius: 4).fill(.red).frame(width: 22, height: 22)
-                        } else {
-                            Circle().fill(.red).frame(width: 22, height: 22)
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-                .help(camera.isRecording ? "Stop recording" : "Start recording")
-                .padding(24)
             }
     }
 }
@@ -521,6 +542,9 @@ struct DungeonMapView: View {
                     }
                 }
                 .frame(width: side * Double(cols), height: side * Double(rows))
+                visionCone(viewSize: geo.size, side: side)
+                    .fill(Color(red: 1.0, green: 0.95, blue: 0.4).opacity(0.18))
+                    .allowsHitTesting(false)
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
@@ -598,6 +622,49 @@ struct DungeonMapView: View {
         if isPlayer { return Color(red: 0.0, green: 0.45, blue: 0.55) }
         if tile.revealed { return Color(white: 0.28) }
         return reachable ? Color(white: 0.22) : Color(white: 0.10)
+    }
+
+    /// Wedge in the player's facing direction — a low-opacity yellow
+    /// "vision cone" that makes facing unambiguous at a glance. Apex
+    /// sits at the front edge of the player tile (not the center) so
+    /// the cone clearly emanates forward instead of swallowing the
+    /// player marker.
+    private func visionCone(viewSize: CGSize, side: Double) -> Path {
+        let cols = DungeonMap.columns
+        let rows = DungeonMap.rows
+        let gridW = side * Double(cols)
+        let gridH = side * Double(rows)
+        let originX = (viewSize.width - gridW) / 2
+        let originY = (viewSize.height - gridH) / 2
+        let cx = originX + (Double(map.playerCol) + 0.5) * side
+        let cy = originY + (Double(map.playerRow) + 0.5) * side
+
+        let (fx, fy): (Double, Double)
+        switch map.playerFacing {
+        case 0:  (fx, fy) = (0, -1)   // north
+        case 1:  (fx, fy) = (1, 0)    // east
+        case 2:  (fx, fy) = (0, 1)    // south
+        case 3:  (fx, fy) = (-1, 0)   // west
+        default: (fx, fy) = (0, -1)
+        }
+        // Perpendicular to facing (90° clockwise in screen coords).
+        let px = -fy, py = fx
+
+        let apexX = cx + fx * (side * 0.5)
+        let apexY = cy + fy * (side * 0.5)
+        let length = side * 2.6
+        let halfWidth = length * tan(35 * .pi / 180)
+        let tipX = apexX + fx * length
+        let tipY = apexY + fy * length
+
+        var path = Path()
+        path.move(to: CGPoint(x: apexX, y: apexY))
+        path.addLine(to: CGPoint(x: tipX - px * halfWidth,
+                                 y: tipY - py * halfWidth))
+        path.addLine(to: CGPoint(x: tipX + px * halfWidth,
+                                 y: tipY + py * halfWidth))
+        path.closeSubpath()
+        return path
     }
 
     private func playerGlyph(facing: Int) -> String {
@@ -1072,7 +1139,13 @@ final class CameraController: NSObject, ObservableObject {
         return r
     }()
 
-    private var hasStarted = false
+    /// Number of views currently asking for live camera frames.
+    /// Touched only on the main queue.
+    private var consumerCount = 0
+    /// True once the AVCaptureSession's inputs/outputs have been set
+    /// up. Touched only on `sessionQueue`. We keep the configuration
+    /// across release/acquire cycles so re-starting is cheap.
+    private var configured = false
 
     // Recording state — touched only on videoQueue.
     private var assetWriter: AVAssetWriter?
@@ -1096,50 +1169,87 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    func start() {
-        guard !hasStarted else { return }
+    /// Register one consumer that needs live camera frames. The
+    /// underlying AVCaptureSession only runs while at least one
+    /// consumer is active. First-ever acquire triggers authorization.
+    func acquire() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.consumerCount += 1
+            guard self.consumerCount == 1 else { return }
+            self.beginCapture()
+        }
+    }
+
+    /// Pair to `acquire`. Stops the session when the last consumer
+    /// releases. Configuration is preserved so the next acquire is
+    /// cheap.
+    func release() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.consumerCount = max(0, self.consumerCount - 1)
+            guard self.consumerCount == 0 else { return }
+            self.endCapture()
+        }
+    }
+
+    private func beginCapture() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            hasStarted = true
-            configureAndRun()
+            startSession()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 guard granted, let self else { return }
-                DispatchQueue.main.async { self.hasStarted = true }
-                self.configureAndRun()
+                self.startSession()
             }
         default:
             return
         }
     }
 
-    private func configureAndRun() {
+    private func startSession() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            self.session.beginConfiguration()
-            self.session.sessionPreset = .high
-
-            guard
-                let device = AVCaptureDevice.default(for: .video),
-                let input = try? AVCaptureDeviceInput(device: device),
-                self.session.canAddInput(input)
-            else {
-                self.session.commitConfiguration()
-                return
+            if !self.configured {
+                self.configureSession()
+                self.configured = true
             }
-            self.session.addInput(input)
-
-            self.videoOutput.alwaysDiscardsLateVideoFrames = true
-            self.videoOutput.videoSettings = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-            ]
-            self.videoOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
-            if self.session.canAddOutput(self.videoOutput) {
-                self.session.addOutput(self.videoOutput)
+            if !self.session.isRunning {
+                self.session.startRunning()
             }
-            self.session.commitConfiguration()
-            self.session.startRunning()
         }
+    }
+
+    private func endCapture() {
+        sessionQueue.async { [weak self] in
+            guard let self, self.session.isRunning else { return }
+            self.session.stopRunning()
+        }
+    }
+
+    private func configureSession() {
+        session.beginConfiguration()
+        session.sessionPreset = .high
+
+        guard
+            let device = AVCaptureDevice.default(for: .video),
+            let input = try? AVCaptureDeviceInput(device: device),
+            session.canAddInput(input)
+        else {
+            session.commitConfiguration()
+            return
+        }
+        session.addInput(input)
+
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        videoOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+        if session.canAddOutput(videoOutput) {
+            session.addOutput(videoOutput)
+        }
+        session.commitConfiguration()
     }
 
     // MARK: - Recording
@@ -1622,13 +1732,16 @@ struct OrbView: View {
                        value: camera.dieResult)
             // In Adventure mode the die is embedded in the main window,
             // so the standalone window is redundant. Dismiss any time
-            // it would appear (auto-open at launch, manual menu pick,
-            // or a mode-switch while open).
+            // it would appear (manual menu pick, or a mode-switch
+            // while open). Auto-open at launch is suppressed at the
+            // scene level.
             .onAppear {
+                camera.acquire()
                 if dieKind == DieKind.d20.rawValue {
                     dismissWindow(id: "orb")
                 }
             }
+            .onDisappear { camera.release() }
             .onChange(of: dieKind) { newValue in
                 if newValue == DieKind.d20.rawValue {
                     dismissWindow(id: "orb")
@@ -1639,13 +1752,16 @@ struct OrbView: View {
 
 /// Compact die-roller embedded in the camera preview during Adventure
 /// mode. Same scene as the standalone window, with smaller result text
-/// and a rounded frame.
+/// and a rounded frame. Driven entirely by keyboard (spacebar) in
+/// Adventure mode — `shaking` mirrors the spacebar's pressed state.
 struct EmbeddedOrbView: View {
+    let shaking: Bool
     @EnvironmentObject var camera: CameraController
     @AppStorage(DieKind.storageKey) private var dieKind: String = DieKind.d6.rawValue
 
     var body: some View {
-        OrbSceneView(camera: camera, hand: camera.hands.first)
+        OrbSceneView(camera: camera, hand: camera.hands.first,
+                     keyboardMode: true, keyboardShaking: shaking)
             .id(dieKind)
             .background(Color(white: 0.04))
             .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -1653,21 +1769,6 @@ struct EmbeddedOrbView: View {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.white.opacity(0.18), lineWidth: 1)
             }
-            .overlay(alignment: .top) {
-                if let result = camera.dieResult {
-                    Text("\(result)")
-                        .font(.system(size: 36, weight: .black, design: .rounded))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(.black.opacity(0.7),
-                                    in: RoundedRectangle(cornerRadius: 12))
-                        .padding(.top, 8)
-                        .transition(.scale.combined(with: .opacity))
-                }
-            }
-            .animation(.spring(response: 0.35, dampingFraction: 0.7),
-                       value: camera.dieResult)
     }
 }
 
@@ -1678,6 +1779,13 @@ struct EmbeddedOrbView: View {
 struct OrbSceneView: NSViewRepresentable {
     let camera: CameraController
     let hand: HandPose?
+    /// When true, the Coordinator ignores hand input and lets the
+    /// parent drive the die via `keyboardShaking` (hold-to-shake,
+    /// release-to-throw). Used in Adventure mode.
+    var keyboardMode: Bool = false
+    /// Parent-controlled "is the user holding the shake key?" flag.
+    /// Only consulted when keyboardMode is true.
+    var keyboardShaking: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -1702,6 +1810,8 @@ struct OrbSceneView: NSViewRepresentable {
 
     func updateNSView(_ nsView: SCNView, context: Context) {
         context.coordinator.targetHand = hand
+        context.coordinator.keyboardMode = keyboardMode
+        context.coordinator.keyboardShaking = keyboardShaking
     }
 
     /// Returns (scene, dieNode, fingertipMarkers). Used by both the live
@@ -2084,6 +2194,7 @@ struct OrbSceneView: NSViewRepresentable {
 
     enum DieState {
         case tracking   // die orientation slerps toward hand roll
+        case shaking    // keyboard-driven: continuous spin while spacebar held
         case spinning   // angular velocity decays to rest
         case settled    // showing a result, waits for next grip
     }
@@ -2141,6 +2252,14 @@ struct OrbSceneView: NSViewRepresentable {
         weak var camera: CameraController?
 
         var targetHand: HandPose?
+        // When true, hand input is ignored and the die is driven by
+        // `keyboardShaking` (hold/release pattern). Set per-frame
+        // from the SwiftUI representable.
+        var keyboardMode: Bool = false
+        var keyboardShaking: Bool = false
+        /// Time accumulated in the current shake. Drives the
+        /// hand-like side-to-side oscillation.
+        private var shakeElapsed: Float = 0
 
         private var smoothedTips: [SIMD2<Float>] = Array(repeating: SIMD2(0.5, 0.5), count: 5)
         private var smoothedStrengths: [Float] = [0, 0, 0, 0, 0]
@@ -2191,6 +2310,12 @@ struct OrbSceneView: NSViewRepresentable {
             let dt = lastTime > 0 ? Float(min(0.05, time - lastTime)) : 1.0 / 60.0
             lastTime = time
 
+            if keyboardMode {
+                runKeyboardFrame(dt: dt)
+                publishKeyboardSnapshot()
+                return
+            }
+
             var targetTips = Array(repeating: SIMD2<Float>(0.5, 0.5), count: 5)
             var targetStrengths: [Float] = [0, 0, 0, 0, 0]
             var targetRoll: Float = 0
@@ -2238,6 +2363,12 @@ struct OrbSceneView: NSViewRepresentable {
             peakSpeed = max(peakSpeed * 0.92, medianPalmSpeed)
 
             switch dieState {
+            case .shaking:
+                // Unreachable in motion mode (only the keyboard
+                // branch transitions into .shaking, and that path
+                // returned early above). Listed so the switch is
+                // exhaustive.
+                break
             case .tracking:
                 // Only let the die track hand roll once a real grip
                 // has latched. Otherwise an ungripped hand passing
@@ -2407,6 +2538,7 @@ struct OrbSceneView: NSViewRepresentable {
                 let stateName: String = {
                     switch dieState {
                     case .tracking: return "track"
+                    case .shaking:  return "shake"
                     case .spinning: return "spin"
                     case .settled:  return "settle"
                     }
@@ -2441,6 +2573,122 @@ struct OrbSceneView: NSViewRepresentable {
                 lastUpdate: Date()
             )
 
+            if let die = crystalNode {
+                OrbSceneView.applySnapshot(snap, toCrystal: die,
+                                           markers: markerNodes)
+            }
+            camera?.updateOrbSnapshot(snap)
+        }
+
+        /// Hold-spacebar-to-shake / release-to-throw state machine.
+        /// Used in Adventure mode; ignores hand input entirely.
+        private func runKeyboardFrame(dt: Float) {
+            // Hand-shake oscillation: a person rattling dice in their
+            // hand mostly moves them side-to-side at a few Hz, with a
+            // smaller vertical bob at double frequency (so the motion
+            // traces a figure-8-ish path), plus chaotic tumbling
+            // inside the cupped hand. We approximate that with a
+            // horizontal sine + vertical sine at 2x + a moderate
+            // continuous rotation. The throw on release picks a
+            // fresh, faster tumble axis to make the toss feel
+            // distinct from the shake.
+            let shakeFreqHz: Float = 4.0
+            let shakeAmpX: Float = 0.45
+            let shakeAmpY: Float = 0.12
+            let shakeTumbleSpeed: Float = 14
+            let throwTumbleSpeed: Float = 40
+
+            switch dieState {
+            case .tracking, .settled:
+                if keyboardShaking {
+                    // Start a shake. Moderate spin (it's tumbling in a
+                    // hand, not free-spinning).
+                    shakeElapsed = 0
+                    let tumble = SIMD3<Float>(
+                        Float.random(in: -1...1),
+                        Float.random(in: -1...1),
+                        Float.random(in: -0.5...0.5)
+                    )
+                    let len = simd_length(tumble)
+                    let axis = len > 0.001 ? tumble / len : SIMD3<Float>(1, 0, 0)
+                    angularVelocity = axis * shakeTumbleSpeed
+                    dieResult = nil
+                    rolledFace = nil
+                    dieState = .shaking
+                }
+            case .shaking:
+                shakeElapsed += dt
+                // Position oscillation.
+                let omega = 2 * Float.pi * shakeFreqHz
+                let xOff = shakeAmpX * sin(omega * shakeElapsed)
+                let yOff = shakeAmpY * sin(2 * omega * shakeElapsed)
+                crystalNode?.position = SCNVector3(Double(xOff), Double(yOff), 0)
+                // Moderate tumble rotation, no decay while held.
+                let speed = simd_length(angularVelocity)
+                if speed > 0.5 {
+                    let axis = angularVelocity / speed
+                    let dq = simd_quatf(angle: speed * dt, axis: axis)
+                    dieOrientation = simd_mul(dq, dieOrientation)
+                }
+                if !keyboardShaking {
+                    // Release: snap back to center, pre-pick a face,
+                    // give a fresh fast tumble, hand off to .spinning
+                    // so the existing decay-and-settle logic finishes
+                    // the roll.
+                    crystalNode?.position = SCNVector3(0, 0, 0)
+                    let tumble = SIMD3<Float>(
+                        Float.random(in: -1...1),
+                        Float.random(in: -1...1),
+                        Float.random(in: -0.5...0.5)
+                    )
+                    let len = simd_length(tumble)
+                    let axis = len > 0.001 ? tumble / len : SIMD3<Float>(1, 0, 0)
+                    angularVelocity = axis * throwTumbleSpeed
+                    let face = Self.randomFaceExcluding(
+                        OrbSceneView.nearestFace(to: dieOrientation))
+                    rolledFace = face
+                    dieState = .spinning
+                    camera?.appendGameMessage("YOU ROLLED THE DIE")
+                }
+            case .spinning:
+                let speed = simd_length(angularVelocity)
+                if speed > 0.5 {
+                    let axis = angularVelocity / speed
+                    let dq = simd_quatf(angle: speed * dt, axis: axis)
+                    dieOrientation = simd_mul(dq, dieOrientation)
+                    angularVelocity *= exp(-2.2 * dt)
+                    if let face = rolledFace, speed < 3 {
+                        let target = OrbSceneView.orientationFor(faceNumber: face)
+                        let approach = (3 - speed) / 3
+                        let step = min(1, approach * dt * 6)
+                        dieOrientation = simd_slerp(dieOrientation, target, step)
+                    }
+                } else {
+                    if let face = rolledFace {
+                        dieOrientation = OrbSceneView.orientationFor(faceNumber: face)
+                        dieResult = face
+                        camera?.appendGameMessage("YOU ROLLED A \(face)")
+                    }
+                    rolledFace = nil
+                    angularVelocity = .zero
+                    dieState = .settled
+                }
+            }
+        }
+
+        /// Snapshot for keyboard mode — no hand data, just die state.
+        /// markers naturally fade out because handPresence is 0.
+        private func publishKeyboardSnapshot() {
+            let snap = OrbSnapshot(
+                roll: 0,
+                totalPress: 0,
+                fingertipPositions: Array(repeating: SIMD2(0.5, 0.5), count: 5),
+                fingertipStrengths: [0, 0, 0, 0, 0],
+                handPresence: 0,
+                dieOrientation: dieOrientation,
+                dieResult: dieResult,
+                lastUpdate: Date()
+            )
             if let die = crystalNode {
                 OrbSceneView.applySnapshot(snap, toCrystal: die,
                                            markers: markerNodes)
