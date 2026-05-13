@@ -198,8 +198,56 @@ struct ContentView: View {
     @AppStorage(AdventureControls.storageKey) private var adventureControls: String = AdventureControls.click.rawValue
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
+    /// Story-floor cap. The bottom of the dungeon — descent attempts
+    /// past this floor get refused. Sized to leave plenty of headroom
+    /// under the memory ceiling (~150 MB if every floor were cached).
+    private static let maxFloor = 100_000
     @State private var dungeonMap = DungeonMap.make(floor: 1)
+    /// Placeholder combat state. HP values stay at placeholders until
+    /// we rig proper combat numbers; the flee mechanic mutates them
+    /// symbolically (1 HP on crit fail / crit success) so the HUD bar
+    /// reacts.
+    @State private var playerHP: Int = 20
+    @State private var playerMaxHP: Int = 20
+    @State private var enemyHP: Int = 8
+    @State private var enemyMaxHP: Int = 8
+    @State private var enemyName: String = "Shade"
+    /// True while a battle "event" is in progress. Stepping onto an
+    /// enemy tile sets this; it stays true until the player flees
+    /// successfully (Fight isn't wired yet). Map controls
+    /// (arrow-keys, click-to-move, stairs) are all blocked while it's
+    /// true so the player can't just walk away from the encounter.
+    @State private var inBattle: Bool = false
+    /// Index into `battleMenuOptions`. Driven by ↑/↓ during battle.
+    @State private var battleMenuIndex: Int = 0
+    /// True between "Flee selected" and "the d20 settled." The next
+    /// dieResult publish in this window is interpreted as the flee
+    /// outcome.
+    @State private var awaitingFleeRoll: Bool = false
+    /// True between "the d20 settled" and "battle resolves." Gives
+    /// the player a beat to actually see the rolled face before the
+    /// fight view fades. All battle inputs are inert during this
+    /// window so a stray key can't kick off a second shake.
+    @State private var resolvingRoll: Bool = false
+    /// How long the settled die stays on screen post-roll. Long
+    /// enough to read the face; short enough not to feel sluggish.
+    private static let postRollHoldSeconds: Double = 1.5
+    /// Every floor the player has ever visited, keyed by floor
+    /// number. On any stairs transition we save the current map into
+    /// the cache and restore the target floor if it's there, so
+    /// re-entering a floor brings back its exact layout, reveal
+    /// state, and player position. The active floor lives in
+    /// `dungeonMap`; the cache holds everything else.
+    @State private var floorsByNumber: [Int: DungeonMap] = [:]
     @State private var shakingDie = false
+    /// Timestamp of the last arrow-driven action. Used to throttle
+    /// key-repeat events when the user holds an arrow, so movement
+    /// has a "discrete step" feel instead of ripping through the
+    /// dungeon at the OS's key-repeat rate.
+    @State private var lastArrowFire: Date = .distantPast
+    /// Minimum time between auto-repeat arrow actions. Initial taps
+    /// (`.down` phase) bypass this; only `.repeat` events get gated.
+    private let arrowRepeatCooldown: TimeInterval = 0.25
     @FocusState private var keyboardFocused: Bool
 
     private var arrowMode: Bool {
@@ -220,7 +268,9 @@ struct ContentView: View {
             if dieKind == DieKind.d20.rawValue {
                 HStack(spacing: 0) {
                     dungeonView3D()
-                    DungeonMapView(map: $dungeonMap) {
+                    DungeonMapView(map: $dungeonMap,
+                                   onStairs: { useStairs() },
+                                   disabled: inBattle) {
                         camera.appendGameMessage($0)
                     }
                 }
@@ -229,20 +279,28 @@ struct ContentView: View {
                 cameraPreview()
             }
         }
-        .focusable(arrowMode)
+        .focusable(arrowMode || inBattle)
         .focusEffectDisabled()
         .focused($keyboardFocused)
-        .onKeyPress(.upArrow)    { handleArrow(.up) }
-        .onKeyPress(.downArrow)  { handleArrow(.down) }
-        .onKeyPress(.leftArrow)  { handleArrow(.left) }
-        .onKeyPress(.rightArrow) { handleArrow(.right) }
+        .onKeyPress(.upArrow,    phases: [.down, .repeat]) { handleArrow(.up,    phase: $0.phase) }
+        .onKeyPress(.downArrow,  phases: [.down, .repeat]) { handleArrow(.down,  phase: $0.phase) }
+        .onKeyPress(.leftArrow,  phases: [.down, .repeat]) { handleArrow(.left,  phase: $0.phase) }
+        .onKeyPress(.rightArrow, phases: [.down, .repeat]) { handleArrow(.right, phase: $0.phase) }
         .onKeyPress(.space, phases: [.down, .up]) { handleSpace($0.phase) }
         .onKeyPress(.return)     { handleInteract() }
-        // If the player moves off an enemy tile mid-shake (e.g.,
-        // arrow key while holding space), drop the shake state so a
-        // future enemy tile doesn't think we're still mid-press.
         .onChange(of: isOnEnemyTile) { newValue in
+            // Drop shake state if we leave the tile mid-press.
             if !newValue { shakingDie = false }
+            // Stepping onto an enemy starts a battle event; map
+            // controls are blocked until the player flees out.
+            if newValue && !inBattle { startBattle() }
+        }
+        .onChange(of: camera.dieResult) { newValue in
+            // The only roll we care about right now is the flee roll
+            // (Fight is locked). When the die settles and we asked
+            // for a flee, apply the outcome.
+            guard let result = newValue, awaitingFleeRoll else { return }
+            handleFleeResult(result)
         }
         .onAppear {
             // The camera is acquired by individual views that need it
@@ -269,8 +327,35 @@ struct ContentView: View {
 
     private enum ArrowDir { case up, down, left, right }
 
-    private func handleArrow(_ dir: ArrowDir) -> KeyPress.Result {
+    private func handleArrow(_ dir: ArrowDir, phase: KeyPress.Phases) -> KeyPress.Result {
+        // While a battle event is running, arrows drive the menu
+        // instead of the map. Left/right have no menu meaning yet, so
+        // they no-op. During the die-roll sub-phase (awaitingFleeRoll)
+        // all arrows are inert so they can't accidentally cancel the
+        // roll.
+        if inBattle {
+            guard phase.contains(.down) else { return .handled }
+            if awaitingFleeRoll || resolvingRoll { return .handled }
+            switch dir {
+            case .up:
+                battleMenuIndex = (battleMenuIndex + battleMenuOptions.count - 1)
+                    % battleMenuOptions.count
+            case .down:
+                battleMenuIndex = (battleMenuIndex + 1) % battleMenuOptions.count
+            case .left, .right:
+                break
+            }
+            return .handled
+        }
         guard arrowMode else { return .ignored }
+        // Key-repeat events get throttled so holding doesn't rip
+        // through the map; discrete taps (.down) always fire.
+        let now = Date()
+        if phase.contains(.repeat),
+           now.timeIntervalSince(lastArrowFire) < arrowRepeatCooldown {
+            return .handled
+        }
+        lastArrowFire = now
         switch dir {
         case .up:    logStep(dungeonMap.step(forward: true))
         case .down:  logStep(dungeonMap.step(forward: false))
@@ -281,38 +366,160 @@ struct ContentView: View {
     }
 
     private func handleInteract() -> KeyPress.Result {
+        if inBattle && resolvingRoll { return .handled }
+        if inBattle && !awaitingFleeRoll {
+            confirmMenuSelection()
+            return .handled
+        }
         guard arrowMode else { return .ignored }
-        let r = dungeonMap.playerRow, c = dungeonMap.playerCol
-        guard dungeonMap.tiles[r][c].kind == .door else { return .ignored }
-        dungeonMap = DungeonMap.make(floor: dungeonMap.floor + 1)
-        camera.appendGameMessage("You descend to floor \(dungeonMap.floor).")
-        return .handled
+        return useStairs() ? .handled : .ignored
     }
 
-    /// Spacebar has two jobs in Adventure mode: drive the die roll
-    /// (hold to shake, release to throw) when standing on an enemy
-    /// tile, otherwise fall back to the existing arrow-mode descend
-    /// behavior on doors. Always clears `shakingDie` on .up so a
-    /// release outside the enemy context can't leave it stuck.
+    /// If the player is standing on a stairs tile, take it. Returns
+    /// true iff a floor transition happened (so callers can report
+    /// the event consumed). Shared by keyboard (`handleInteract`) and
+    /// 2D click ("re-click your own tile") so both modes route
+    /// through the same cache logic.
+    @discardableResult
+    private func useStairs() -> Bool {
+        // Stairs are inert during a battle event — the player has to
+        // resolve the encounter before moving floors.
+        guard !inBattle else { return false }
+        let r = dungeonMap.playerRow, c = dungeonMap.playerCol
+        switch dungeonMap.tiles[r][c].kind {
+        case .door:
+            let next = dungeonMap.floor + 1
+            guard next <= Self.maxFloor else {
+                camera.appendGameMessage("The door refuses to open. The dungeon ends here.")
+                return true
+            }
+            floorsByNumber[dungeonMap.floor] = dungeonMap
+            if let saved = floorsByNumber[next] {
+                dungeonMap = saved
+            } else {
+                dungeonMap = DungeonMap.make(floor: next,
+                                             spawn: (r, c),
+                                             spawnIsStairsUp: true)
+            }
+            camera.appendGameMessage("You descend to floor \(dungeonMap.floor).")
+            return true
+        case .stairsUp:
+            let prev = dungeonMap.floor - 1
+            guard prev >= 1, let saved = floorsByNumber[prev] else { return false }
+            floorsByNumber[dungeonMap.floor] = dungeonMap
+            dungeonMap = saved
+            camera.appendGameMessage("You ascend to floor \(dungeonMap.floor).")
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Spacebar's jobs (in priority order):
+    ///   1. In the flee-roll sub-phase: hold to shake, release to throw.
+    ///   2. In the battle menu (pre-roll): confirms the selected option.
+    ///   3. Otherwise: arrow-mode descend on doors / ascend on stairs-up.
+    /// Always clears `shakingDie` on .up so a release in the wrong
+    /// phase can't leave the die stuck mid-shake.
     private func handleSpace(_ phase: KeyPress.Phases) -> KeyPress.Result {
         let down = phase.contains(.down)
         let up = phase.contains(.up)
         if up { shakingDie = false }
-        if isOnEnemyTile {
-            if down { shakingDie = true }
+        if inBattle {
+            if resolvingRoll { return .handled }
+            if awaitingFleeRoll {
+                if down { shakingDie = true }
+                return .handled
+            }
+            if down { confirmMenuSelection() }
             return .handled
         }
         if down { return handleInteract() }
         return .ignored
     }
 
+    // MARK: - Battle event
+
+    /// Phantasy-Star-style action menu. Only Flee is wired up right
+    /// now; the other three log "not yet available" on confirm so
+    /// they read as planned-but-inactive.
+    private var battleMenuOptions: [BattleMenuOption] {
+        [
+            BattleMenuOption(name: "Fight", enabled: false),
+            BattleMenuOption(name: "Item",  enabled: false),
+            BattleMenuOption(name: "Hack",  enabled: false),
+            BattleMenuOption(name: "Flee",  enabled: true),
+        ]
+    }
+
+    private func startBattle() {
+        inBattle = true
+        battleMenuIndex = 0
+        awaitingFleeRoll = false
+        keyboardFocused = true
+        camera.appendGameMessage("\(enemyName.uppercased()) bars your path. Battle!")
+    }
+
+    private func endBattle() {
+        inBattle = false
+        awaitingFleeRoll = false
+        shakingDie = false
+    }
+
+    private func confirmMenuSelection() {
+        let opt = battleMenuOptions[battleMenuIndex]
+        guard opt.enabled else {
+            camera.appendGameMessage("\(opt.name.uppercased()) is not yet available.")
+            return
+        }
+        switch opt.name {
+        case "Flee":
+            awaitingFleeRoll = true
+            camera.appendGameMessage("You move to flee. Roll the die — hold SPACE, release to throw.")
+        default:
+            break
+        }
+    }
+
+    private func handleFleeResult(_ roll: Int) {
+        awaitingFleeRoll = false
+        resolvingRoll = true
+        var success = false
+        switch roll {
+        case 1:
+            playerHP = max(0, playerHP - 3)
+            camera.appendGameMessage("CRITICAL FAIL — \(enemyName) catches you. You take 3 damage.")
+        case 2...10:
+            playerHP = max(0, playerHP - 1)
+            camera.appendGameMessage("You roll \(roll). You fail to escape and take 1 damage.")
+        case 11...19:
+            camera.appendGameMessage("You roll \(roll). You break away and escape!")
+            success = true
+        case 20:
+            enemyHP = max(0, enemyHP - 1)
+            camera.appendGameMessage("CRITICAL SUCCESS — A parting blow lands! You escape and \(enemyName) takes 1 damage.")
+            success = true
+        default:
+            camera.appendGameMessage("You roll \(roll). The result is unclear.")
+        }
+        // Hold the settled die on screen briefly. On success, this
+        // also delays the fade back to the dungeon — without it the
+        // result is gone before the player can read the face.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.postRollHoldSeconds) {
+            resolvingRoll = false
+            if success { endBattle() }
+        }
+    }
+
     private func logStep(_ kind: DungeonTileKind?) {
         guard let kind else { return }
         switch kind {
-        case .empty: camera.appendGameMessage("You step into an empty space.")
-        case .chest: camera.appendGameMessage("You find a treasure chest.")
-        case .enemy: camera.appendGameMessage("You spot an enemy.")
-        case .door:  camera.appendGameMessage("You find a door leading down. Press space to descend.")
+        case .empty:    camera.appendGameMessage("You step into an empty space.")
+        case .wall:     break  // unreachable — step() rejects wall tiles
+        case .chest:    camera.appendGameMessage("You find a treasure chest.")
+        case .enemy:    camera.appendGameMessage("You spot an enemy.")
+        case .door:     camera.appendGameMessage("You find a door leading down. Press space to descend.")
+        case .stairsUp: camera.appendGameMessage("Stairs lead back up. Press space to ascend.")
         }
     }
 
@@ -326,15 +533,39 @@ struct ContentView: View {
     }
 
     private func dungeonView3D() -> some View {
+        // Keep both 3D scenes in the view hierarchy at all times and
+        // swap via opacity instead of an if/else conditional. SceneKit
+        // JIT-compiles Metal pipeline state on a scene's first draw,
+        // which stalls the main thread for ~1s the first time you
+        // step on an enemy tile if FightView3D is created on demand.
+        // Building it at launch warms the shader cache so the swap
+        // is instant.
         standardOverlays(
-            DungeonView3D(map: dungeonMap),
-            embedOrb: isOnEnemyTile
+            ZStack {
+                DungeonView3D(map: dungeonMap)
+                    .opacity(inBattle ? 0 : 1)
+                    .allowsHitTesting(!inBattle)
+                FightView3D()
+                    .opacity(inBattle ? 1 : 0)
+                    .allowsHitTesting(inBattle)
+                BattleHUD(enemyName: enemyName,
+                          enemyHP: enemyHP, enemyMaxHP: enemyMaxHP,
+                          playerHP: playerHP, playerMaxHP: playerMaxHP,
+                          menu: battleMenuOptions,
+                          menuIndex: battleMenuIndex,
+                          awaitingFleeRoll: awaitingFleeRoll,
+                          resolvingRoll: resolvingRoll,
+                          rollValue: camera.dieResult)
+                    .opacity(inBattle ? 1 : 0)
+                    .allowsHitTesting(false)
+            },
+            embedOrb: inBattle
         )
         .overlay(alignment: .bottomLeading) {
-            // Hide the on-screen turn buttons in arrow-keys mode —
-            // ←/→ already do the same thing, and the click-style
-            // affordances would be misleading.
-            if !arrowMode {
+            // Hide the on-screen turn buttons in arrow-keys mode (←/→
+            // do the same thing) and during combat (you can't turn
+            // mid-fight). Turn buttons stay otherwise.
+            if !arrowMode && !inBattle {
                 HStack(spacing: 12) {
                     turnButton("◀") { dungeonMap.turn(by: -1) }
                     turnButton("▶") { dungeonMap.turn(by: 1) }
@@ -395,7 +626,7 @@ struct ContentView: View {
 }
 
 enum DungeonTileKind {
-    case empty, chest, enemy, door
+    case empty, wall, chest, enemy, door, stairsUp
 }
 
 struct DungeonTile {
@@ -417,32 +648,78 @@ struct DungeonMap {
     /// Drives the 3D camera yaw and the player marker on the 2D map.
     var playerFacing: Int
 
-    static func make(floor: Int) -> DungeonMap {
+    /// `spawn` lets a descending floor land the player at the same
+    /// (row, col) as the door they used — so a floor stitches
+    /// geographically onto the one above it. Defaults to map center
+    /// for floor 1. `spawnIsStairsUp` places a stairs-up tile there so
+    /// the player can climb back; floor 1 leaves it empty.
+    static func make(floor: Int,
+                     spawn: (row: Int, col: Int)? = nil,
+                     spawnIsStairsUp: Bool = false) -> DungeonMap {
         var grid: [[DungeonTile]] = (0..<rows).map { _ in
             (0..<columns).map { _ in
                 DungeonTile(kind: randomKind(), revealed: false)
             }
         }
-        // Guarantee at least one door so the floor is always escapable.
-        let hasDoor = grid.flatMap { $0 }.contains { $0.kind == .door }
-        if !hasDoor {
-            let r = Int.random(in: 0..<rows)
-            let c = Int.random(in: 0..<columns)
-            grid[r][c].kind = .door
-        }
-        // Spawn point: center, forced empty and pre-revealed. Player
-        // starts here facing north.
-        let sr = rows / 2, sc = columns / 2
-        grid[sr][sc].kind = .empty
+        let sr = spawn?.row ?? rows / 2
+        let sc = spawn?.col ?? columns / 2
+        grid[sr][sc].kind = spawnIsStairsUp ? .stairsUp : .empty
         grid[sr][sc].revealed = true
-        return DungeonMap(tiles: grid, floor: floor,
-                          playerRow: sr, playerCol: sc,
-                          playerFacing: 0)
+
+        // Flood-fill from spawn over non-wall tiles to find the
+        // playable region. Anything outside it is unreachable, so the
+        // door (the only way down) must live inside it.
+        var reachable = Array(repeating: Array(repeating: false, count: columns),
+                              count: rows)
+        var stack: [(Int, Int)] = [(sr, sc)]
+        reachable[sr][sc] = true
+        while let (r, c) = stack.popLast() {
+            for (dr, dc) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let nr = r + dr, nc = c + dc
+                guard nr >= 0, nr < rows, nc >= 0, nc < columns else { continue }
+                guard !reachable[nr][nc] else { continue }
+                guard grid[nr][nc].kind != .wall else { continue }
+                reachable[nr][nc] = true
+                stack.append((nr, nc))
+            }
+        }
+
+        var reachableCoords: [(Int, Int)] = []
+        var hasReachableDoor = false
+        for r in 0..<rows {
+            for c in 0..<columns {
+                guard reachable[r][c] else { continue }
+                reachableCoords.append((r, c))
+                if grid[r][c].kind == .door { hasReachableDoor = true }
+            }
+        }
+        if !hasReachableDoor {
+            let candidates = reachableCoords.filter { !($0.0 == sr && $0.1 == sc) }
+            if let pick = candidates.randomElement() {
+                grid[pick.0][pick.1].kind = .door
+            } else {
+                // Spawn boxed in by walls on all four sides — knock one
+                // out and put the door there.
+                for (dr, dc) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nr = sr + dr, nc = sc + dc
+                    guard nr >= 0, nr < rows, nc >= 0, nc < columns else { continue }
+                    grid[nr][nc].kind = .door
+                    break
+                }
+            }
+        }
+
+        var map = DungeonMap(tiles: grid, floor: floor,
+                             playerRow: sr, playerCol: sc,
+                             playerFacing: 0)
+        map.revealAdjacentWalls(row: sr, col: sc)
+        return map
     }
 
     private static func randomKind() -> DungeonTileKind {
         switch Double.random(in: 0..<1) {
-        case ..<0.74: return .empty
+        case ..<0.62: return .empty
+        case ..<0.74: return .wall
         case ..<0.86: return .chest
         case ..<0.96: return .enemy
         default:      return .door
@@ -454,9 +731,22 @@ struct DungeonMap {
     /// "tiles to highlight on the 3D floor."
     func canMoveTo(row: Int, col: Int) -> Bool {
         guard row >= 0, row < Self.rows, col >= 0, col < Self.columns else { return false }
+        guard tiles[row][col].kind != .wall else { return false }
         let dr = abs(row - playerRow)
         let dc = abs(col - playerCol)
         return (dr + dc) == 1
+    }
+
+    /// Mark wall tiles 4-adjacent to (row, col) as revealed so the
+    /// player can see the walls of the area they're standing in. Open
+    /// tiles get revealed by stepping onto them — walls never can,
+    /// so we surface them indirectly.
+    mutating func revealAdjacentWalls(row: Int, col: Int) {
+        for (dr, dc) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let nr = row + dr, nc = col + dc
+            guard nr >= 0, nr < Self.rows, nc >= 0, nc < Self.columns else { continue }
+            if tiles[nr][nc].kind == .wall { tiles[nr][nc].revealed = true }
+        }
     }
 
     /// Move the player onto (row, col), auto-turning to face the
@@ -474,6 +764,7 @@ struct DungeonMap {
         tiles[row][col].revealed = true
         playerRow = row
         playerCol = col
+        revealAdjacentWalls(row: row, col: col)
         return wasRevealed ? nil : tiles[row][col].kind
     }
 
@@ -505,10 +796,12 @@ struct DungeonMap {
         let r = playerRow + dr
         let c = playerCol + dc
         guard r >= 0, r < Self.rows, c >= 0, c < Self.columns else { return nil }
+        guard tiles[r][c].kind != .wall else { return nil }
         let wasRevealed = tiles[r][c].revealed
         tiles[r][c].revealed = true
         playerRow = r
         playerCol = c
+        revealAdjacentWalls(row: r, col: c)
         return wasRevealed ? nil : tiles[r][c].kind
     }
 }
@@ -516,10 +809,15 @@ struct DungeonMap {
 struct DungeonMapView: View {
     @Binding var map: DungeonMap
     @AppStorage(AdventureControls.storageKey) private var controls: String = AdventureControls.click.rawValue
+    var onStairs: () -> Void
+    /// External lockout (e.g., battle in progress). When true, all
+    /// taps no-op — movement and stair use must wait until the lock
+    /// clears.
+    var disabled: Bool = false
     var log: (String) -> Void
 
     private var clickToMove: Bool {
-        controls == AdventureControls.click.rawValue
+        controls == AdventureControls.click.rawValue && !disabled
     }
 
     var body: some View {
@@ -594,13 +892,13 @@ struct DungeonMapView: View {
         // and descent happen via the keyboard.
         guard clickToMove else { return }
         let isPlayer = (row == map.playerRow && col == map.playerCol)
-        // Re-clicking your own tile: descend if it's a door, otherwise
-        // no-op.
+        // Re-clicking your own tile: take stairs if there are any
+        // (down on a door, up on a stairs-up tile). The parent owns
+        // the floor-history stack so we route through `onStairs`
+        // rather than mutating the map locally.
         if isPlayer {
-            if map.tiles[row][col].kind == .door {
-                map = DungeonMap.make(floor: map.floor + 1)
-                log("You descend to floor \(map.floor).")
-            }
+            let kind = map.tiles[row][col].kind
+            if kind == .door || kind == .stairsUp { onStairs() }
             return
         }
         guard map.canMoveTo(row: row, col: col) else { return }
@@ -609,10 +907,12 @@ struct DungeonMapView: View {
         // its own feedback. Only newly-revealed tiles log discovery.
         guard let kind = discovered else { return }
         switch kind {
-        case .empty: log("You step into an empty space.")
-        case .chest: log("You find a treasure chest.")
-        case .enemy: log("You spot an enemy.")
-        case .door:  log("You find a door leading down. Click again to descend.")
+        case .empty:    log("You step into an empty space.")
+        case .wall:     break  // unreachable — step() rejects wall tiles
+        case .chest:    log("You find a treasure chest.")
+        case .enemy:    log("You spot an enemy.")
+        case .door:     log("You find a door leading down. Click again to descend.")
+        case .stairsUp: log("Stairs lead back up. Click again to ascend.")
         }
     }
 
@@ -620,6 +920,9 @@ struct DungeonMapView: View {
                           isPlayer: Bool,
                           reachable: Bool) -> Color {
         if isPlayer { return Color(red: 0.0, green: 0.45, blue: 0.55) }
+        if tile.kind == .wall && tile.revealed {
+            return Color(red: 0.18, green: 0.14, blue: 0.10)
+        }
         if tile.revealed { return Color(white: 0.28) }
         return reachable ? Color(white: 0.22) : Color(white: 0.10)
     }
@@ -679,19 +982,23 @@ struct DungeonMapView: View {
 
     private func glyph(for kind: DungeonTileKind) -> String {
         switch kind {
-        case .empty: return "·"
-        case .chest: return "$"
-        case .enemy: return "E"
-        case .door:  return "⌂"
+        case .empty:    return "·"
+        case .wall:     return "#"
+        case .chest:    return "$"
+        case .enemy:    return "E"
+        case .door:     return "⌂"
+        case .stairsUp: return "↑"
         }
     }
 
     private func glyphColor(for kind: DungeonTileKind) -> Color {
         switch kind {
-        case .empty: return Color(white: 0.55)
-        case .chest: return Color(red: 0.95, green: 0.78, blue: 0.30)
-        case .enemy: return Color(red: 0.92, green: 0.32, blue: 0.32)
-        case .door:  return Color(red: 0.40, green: 0.78, blue: 0.95)
+        case .empty:    return Color(white: 0.55)
+        case .wall:     return Color(red: 0.95, green: 0.65, blue: 0.35)
+        case .chest:    return Color(red: 0.95, green: 0.78, blue: 0.30)
+        case .enemy:    return Color(red: 0.92, green: 0.32, blue: 0.32)
+        case .door:     return Color(red: 0.40, green: 0.78, blue: 0.95)
+        case .stairsUp: return Color(red: 1.00, green: 0.55, blue: 0.75)
         }
     }
 }
@@ -823,11 +1130,13 @@ struct DungeonView3D: NSViewRepresentable {
             SIMD3<Float>(Float(col) - cx, 0, Float(row) - cz)
         }
 
-        var floorSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
-        var wallSegs:  [(SIMD3<Float>, SIMD3<Float>)] = []
-        var chestSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
-        var enemySegs: [(SIMD3<Float>, SIMD3<Float>)] = []
-        var doorSegs:  [(SIMD3<Float>, SIMD3<Float>)] = []
+        var floorSegs:    [(SIMD3<Float>, SIMD3<Float>)] = []
+        var fogSegs:      [(SIMD3<Float>, SIMD3<Float>)] = []
+        var wallSegs:     [(SIMD3<Float>, SIMD3<Float>)] = []
+        var chestSegs:    [(SIMD3<Float>, SIMD3<Float>)] = []
+        var enemySegs:    [(SIMD3<Float>, SIMD3<Float>)] = []
+        var doorSegs:     [(SIMD3<Float>, SIMD3<Float>)] = []
+        var stairsUpSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
 
         for r in 0..<rows {
             for c in 0..<cols {
@@ -835,6 +1144,28 @@ struct DungeonView3D: NSViewRepresentable {
                 let revealed = tile.revealed
                 let reachable = map.canMoveTo(row: r, col: c)
                 let p = tileCenter(row: r, col: c)
+
+                if tile.kind == .wall {
+                    // Walls are obstacles, not floor. An unrevealed
+                    // wall renders as ordinary fog so it doesn't leak
+                    // map info; a revealed wall gets a filled amber
+                    // block — solid fill reads as "impassable" more
+                    // clearly than a hollow outline. Wireframe edges
+                    // still go on top so the cube's silhouette is
+                    // legible against the flat fill.
+                    if revealed {
+                        addSolidWallBlock(to: scene,
+                                          center: SIMD3<Float>(p.x, 0.6, p.z))
+                        addBoxEdges(to: &wallSegs,
+                                     center: SIMD3<Float>(p.x, 0.6, p.z),
+                                     size: SIMD3<Float>(0.94, 1.2, 0.94))
+                    } else {
+                        addBoxEdges(to: &fogSegs,
+                                     center: SIMD3<Float>(p.x, 0.6, p.z),
+                                     size: SIMD3<Float>(0.94, 1.2, 0.94))
+                    }
+                    continue
+                }
 
                 if revealed || reachable {
                     // Floor tile outline.
@@ -849,14 +1180,14 @@ struct DungeonView3D: NSViewRepresentable {
                     floorSegs.append((d, a))
                 } else {
                     // Unknown region: wireframe fog pillar.
-                    addBoxEdges(to: &wallSegs,
+                    addBoxEdges(to: &fogSegs,
                                  center: SIMD3<Float>(p.x, 0.6, p.z),
                                  size: SIMD3<Float>(0.94, 1.2, 0.94))
                 }
 
                 guard revealed else { continue }
                 switch tile.kind {
-                case .empty:
+                case .empty, .wall:
                     break
                 case .chest:
                     addBoxEdges(to: &chestSegs,
@@ -867,22 +1198,28 @@ struct DungeonView3D: NSViewRepresentable {
                                      baseSize: 0.52, height: 0.7)
                 case .door:
                     addDoorEdges(to: &doorSegs, base: p)
+                case .stairsUp:
+                    addDoorEdges(to: &stairsUpSegs, base: p)
                 }
             }
         }
 
-        let floorColor = NSColor(calibratedRed: 0.20, green: 1.00, blue: 0.50, alpha: 1)
-        let wallColor  = NSColor(calibratedRed: 0.25, green: 0.55, blue: 1.00, alpha: 1)
-        let chestColor = NSColor(calibratedRed: 0.65, green: 1.00, blue: 0.30, alpha: 1)
-        let enemyColor = NSColor(calibratedRed: 0.00, green: 0.95, blue: 1.00, alpha: 1)
-        let doorColor  = NSColor(calibratedRed: 0.45, green: 0.80, blue: 1.00, alpha: 1)
+        let floorColor    = NSColor(calibratedRed: 0.20, green: 1.00, blue: 0.50, alpha: 1)
+        let fogColor      = NSColor(calibratedRed: 0.25, green: 0.55, blue: 1.00, alpha: 1)
+        let wallColor     = NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.20, alpha: 1)
+        let chestColor    = NSColor(calibratedRed: 0.65, green: 1.00, blue: 0.30, alpha: 1)
+        let enemyColor    = NSColor(calibratedRed: 0.00, green: 0.95, blue: 1.00, alpha: 1)
+        let doorColor     = NSColor(calibratedRed: 0.45, green: 0.80, blue: 1.00, alpha: 1)
+        let stairsUpColor = NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.80, alpha: 1)
 
         for (segs, color) in [
-            (floorSegs, floorColor),
-            (wallSegs,  wallColor),
-            (chestSegs, chestColor),
-            (enemySegs, enemyColor),
-            (doorSegs,  doorColor),
+            (floorSegs,    floorColor),
+            (fogSegs,      fogColor),
+            (wallSegs,     wallColor),
+            (chestSegs,    chestColor),
+            (enemySegs,    enemyColor),
+            (doorSegs,     doorColor),
+            (stairsUpSegs, stairsUpColor),
         ] {
             guard let geom = buildLineGeometry(segments: segs, color: color) else { continue }
             let node = SCNNode(geometry: geom)
@@ -896,7 +1233,7 @@ struct DungeonView3D: NSViewRepresentable {
     /// Build a `.line`-primitive SCNGeometry over a list of segment pairs.
     /// Returns nil when there's nothing to draw so callers can skip
     /// adding a useless node.
-    private static func buildLineGeometry(
+    static func buildLineGeometry(
         segments: [(SIMD3<Float>, SIMD3<Float>)],
         color: NSColor
     ) -> SCNGeometry? {
@@ -941,7 +1278,33 @@ struct DungeonView3D: NSViewRepresentable {
         return geom
     }
 
-    private static func addBoxEdges(
+    /// Translucent amber block for a revealed wall tile. The tint
+    /// reads as a barrier without fully hiding what's behind it; the
+    /// wireframe edges (added separately at a slightly larger size)
+    /// sit on top via `renderingOrder = -1`, which forces the fill
+    /// to draw before everything else so the bright outline renders
+    /// over it.
+    static func addSolidWallBlock(
+        to scene: SCNScene, center: SIMD3<Float>
+    ) {
+        let box = SCNBox(width: 0.92, height: 1.18, length: 0.92,
+                         chamferRadius: 0)
+        let m = SCNMaterial()
+        m.lightingModel = .constant
+        m.diffuse.contents  = NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.20, alpha: 1)
+        m.emission.contents = NSColor(calibratedRed: 0.25, green: 0.10, blue: 0.02, alpha: 1)
+        m.transparency = 0.22
+        m.blendMode = .alpha
+        m.isDoubleSided = false
+        box.firstMaterial = m
+        let node = SCNNode(geometry: box)
+        node.position = SCNVector3(center.x, center.y, center.z)
+        node.renderingOrder = -1
+        node.name = contentTag
+        scene.rootNode.addChildNode(node)
+    }
+
+    static func addBoxEdges(
         to segments: inout [(SIMD3<Float>, SIMD3<Float>)],
         center: SIMD3<Float>, size: SIMD3<Float>
     ) {
@@ -1007,6 +1370,240 @@ struct DungeonView3D: NSViewRepresentable {
         segments.append((p3, p2))   // lintel
         segments.append((p0, p2))   // diagonal
         segments.append((p1, p3))   // diagonal
+    }
+}
+
+/// Phantasy-Star-style first-person combat tableau. The enemy looms
+/// in the middle of the view; a wireframe silhouette of the player's
+/// upper body frames the bottom of the screen. Combat itself resolves
+/// through the die-roll overlay the parent view layers on top of this
+/// scene — this view is the *backdrop* for the fight, not its logic.
+struct FightView3D: NSViewRepresentable {
+    func makeNSView(context: Context) -> SCNView {
+        let view = SCNView()
+        view.backgroundColor = .black
+        view.antialiasingMode = .multisampling4X
+        view.allowsCameraControl = false
+        view.isPlaying = true
+        view.rendersContinuously = false
+
+        let scene = SCNScene()
+        scene.background.contents = NSColor.black
+
+        let camNode = SCNNode()
+        let cam = SCNCamera()
+        cam.fieldOfView = 60
+        cam.zNear = 0.05
+        cam.zFar = 60
+        camNode.camera = cam
+        camNode.position = SCNVector3(0, 2.0, 3.5)
+        camNode.eulerAngles = SCNVector3(-0.15, 0, 0)
+        scene.rootNode.addChildNode(camNode)
+
+        addFloorGrid(to: scene)
+        addEnemy(to: scene)
+        addPlayerSilhouette(to: scene)
+
+        view.scene = scene
+        return view
+    }
+
+    func updateNSView(_ nsView: SCNView, context: Context) {
+        // Static tableau — no per-frame state yet.
+    }
+
+    /// Receding floor grid for spatial context. Tron green, matching
+    /// the dungeon's floor color so the combat reads as "still inside
+    /// the same world."
+    private func addFloorGrid(to scene: SCNScene) {
+        var segs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        let halfX: Float = 2.5
+        let zNear: Float = -1.0
+        let zFar:  Float = 3.5
+        let step:  Float = 0.5
+        var x = -halfX
+        while x <= halfX + 0.001 {
+            segs.append((SIMD3(x, 0, zNear), SIMD3(x, 0, zFar)))
+            x += step
+        }
+        var z = zNear
+        while z <= zFar + 0.001 {
+            segs.append((SIMD3(-halfX, 0, z), SIMD3(halfX, 0, z)))
+            z += step
+        }
+        let color = NSColor(calibratedRed: 0.20, green: 1.00, blue: 0.50, alpha: 1)
+        if let g = DungeonView3D.buildLineGeometry(segments: segs, color: color) {
+            scene.rootNode.addChildNode(SCNNode(geometry: g))
+        }
+    }
+
+    /// Humanoid enemy wireframe at world origin, facing the camera.
+    /// Cyan so it matches the dungeon's existing enemy color.
+    private func addEnemy(to scene: SCNScene) {
+        var segs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        DungeonView3D.addBoxEdges(to: &segs,
+                                   center: SIMD3(0, 1.55, 0),
+                                   size: SIMD3(0.4, 0.4, 0.4))                // head
+        segs.append((SIMD3(0, 1.35, 0), SIMD3(0, 1.25, 0)))                   // neck
+        segs.append((SIMD3(-0.4, 1.25, 0), SIMD3(0.4, 1.25, 0)))              // shoulders
+        segs.append((SIMD3(0, 1.25, 0), SIMD3(0, 0.65, 0)))                   // spine
+        segs.append((SIMD3(-0.3, 0.65, 0), SIMD3(0.3, 0.65, 0)))              // hips
+        segs.append((SIMD3(-0.4, 1.25, 0), SIMD3(-0.55, 0.75, 0)))            // L upper arm
+        segs.append((SIMD3(-0.55, 0.75, 0), SIMD3(-0.5, 0.35, 0)))            // L forearm
+        segs.append((SIMD3(0.4, 1.25, 0),  SIMD3(0.55, 0.75, 0)))             // R upper arm
+        segs.append((SIMD3(0.55, 0.75, 0), SIMD3(0.5, 0.35, 0)))              // R forearm
+        segs.append((SIMD3(-0.3, 0.65, 0), SIMD3(-0.25, 0.05, 0)))            // L leg
+        segs.append((SIMD3(0.3, 0.65, 0),  SIMD3(0.25, 0.05, 0)))             // R leg
+        // Glowing eyes — short bars on the front face of the head box.
+        segs.append((SIMD3(-0.15, 1.6, 0.2), SIMD3(-0.05, 1.6, 0.2)))
+        segs.append((SIMD3(0.05, 1.6, 0.2),  SIMD3(0.15, 1.6, 0.2)))
+        let color = NSColor(calibratedRed: 0.00, green: 0.95, blue: 1.00, alpha: 1)
+        if let g = DungeonView3D.buildLineGeometry(segments: segs, color: color) {
+            scene.rootNode.addChildNode(SCNNode(geometry: g))
+        }
+    }
+
+    /// The player's upper body from behind, parked between the camera
+    /// and the enemy so it crops to "waist-up at the bottom of the
+    /// screen." Green to match the dungeon floor / player palette,
+    /// with a sword extending toward the enemy.
+    private func addPlayerSilhouette(to scene: SCNScene) {
+        var segs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        let z: Float = 2.5
+        // Shoulders, torso outline, waist.
+        segs.append((SIMD3(-0.65, 1.45, z), SIMD3(0.65, 1.45, z)))
+        segs.append((SIMD3(-0.55, 1.45, z), SIMD3(-0.5, 0.7, z)))
+        segs.append((SIMD3(0.55, 1.45, z),  SIMD3(0.5, 0.7, z)))
+        segs.append((SIMD3(-0.5, 0.7, z),   SIMD3(0.5, 0.7, z)))
+        // Neck.
+        segs.append((SIMD3(-0.18, 1.45, z), SIMD3(-0.18, 1.6, z)))
+        segs.append((SIMD3(0.18, 1.45, z),  SIMD3(0.18, 1.6, z)))
+        // Back of head.
+        DungeonView3D.addBoxEdges(to: &segs,
+                                   center: SIMD3(0, 1.8, z),
+                                   size: SIMD3(0.42, 0.4, 0.4))
+        // Arms holding a sword extended toward the enemy.
+        segs.append((SIMD3(-0.65, 1.45, z), SIMD3(-0.85, 1.2, z)))
+        segs.append((SIMD3(-0.85, 1.2, z),  SIMD3(-0.18, 1.3, z - 0.4)))
+        segs.append((SIMD3(0.65, 1.45, z),  SIMD3(0.85, 1.2, z)))
+        segs.append((SIMD3(0.85, 1.2, z),   SIMD3(0.18, 1.3, z - 0.4)))
+        // Sword: crossguard, then long blade pointing into the scene.
+        segs.append((SIMD3(-0.18, 1.32, z - 0.4), SIMD3(0.18, 1.32, z - 0.4)))
+        segs.append((SIMD3(0, 1.32, z - 0.4),     SIMD3(0, 1.32, z - 1.6)))
+        let color = NSColor(calibratedRed: 0.20, green: 1.00, blue: 0.50, alpha: 1)
+        if let g = DungeonView3D.buildLineGeometry(segments: segs, color: color) {
+            scene.rootNode.addChildNode(SCNNode(geometry: g))
+        }
+    }
+}
+
+struct BattleMenuOption {
+    let name: String
+    let enabled: Bool
+}
+
+/// Phantasy-Star-style combat readout: enemy strip at the top, player
+/// strip + action menu at the bottom, both in the same monospaced
+/// font as the game text log so the screen reads as one piece. All
+/// state is passed in — this view is presentation-only.
+struct BattleHUD: View {
+    let enemyName: String
+    let enemyHP: Int
+    let enemyMaxHP: Int
+    let playerHP: Int
+    let playerMaxHP: Int
+    let menu: [BattleMenuOption]
+    let menuIndex: Int
+    let awaitingFleeRoll: Bool
+    let resolvingRoll: Bool
+    let rollValue: Int?
+
+    private static let barWidth = 20
+    private static let enemyColor = Color(red: 0.95, green: 0.35, blue: 0.35)
+    private static let playerColor = Color(red: 0.30, green: 0.95, blue: 0.55)
+    private static let selectColor = Color(red: 1.00, green: 0.95, blue: 0.40)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            stripPanel {
+                Text(enemyName.uppercased())
+                    .foregroundColor(.white)
+                hpLine(current: enemyHP, max: enemyMaxHP, color: Self.enemyColor)
+            }
+            Spacer()
+            stripPanel {
+                HStack(alignment: .top, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("HERO")
+                            .foregroundColor(.white)
+                        hpLine(current: playerHP, max: playerMaxHP, color: Self.playerColor)
+                    }
+                    Spacer()
+                    if resolvingRoll {
+                        Text(rollValue.map { "ROLLED \($0)" } ?? "ROLLED")
+                            .foregroundColor(Self.selectColor)
+                    } else if awaitingFleeRoll {
+                        Text("ROLL THE DIE TO FLEE\nHOLD SPACE — RELEASE TO THROW")
+                            .multilineTextAlignment(.trailing)
+                            .foregroundColor(Self.selectColor)
+                    } else {
+                        menuView
+                    }
+                }
+            }
+        }
+        .font(.system(.title3, design: .monospaced).weight(.semibold))
+        .padding(20)
+    }
+
+    private var menuView: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(menu.enumerated()), id: \.offset) { idx, opt in
+                let selected = idx == menuIndex
+                HStack(spacing: 6) {
+                    Text(selected ? "►" : " ")
+                        .foregroundColor(Self.selectColor)
+                    Text(opt.name.uppercased())
+                        .foregroundColor(color(for: opt, selected: selected))
+                }
+            }
+        }
+    }
+
+    private func color(for opt: BattleMenuOption, selected: Bool) -> Color {
+        if !opt.enabled { return Color(white: 0.4) }
+        return selected ? Self.selectColor : .white
+    }
+
+    @ViewBuilder
+    private func stripPanel<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            content()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.black.opacity(0.65),
+                     in: RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    private func hpLine(current: Int, max: Int, color: Color) -> some View {
+        let bars = Self.barWidth
+        let denom = Swift.max(max, 1)
+        let filled = Swift.max(0, Swift.min(bars, Int(Double(bars) * Double(current) / Double(denom))))
+        let empty = bars - filled
+        let bar = "[" + String(repeating: "█", count: filled)
+                      + String(repeating: "░", count: empty) + "]"
+        return HStack(spacing: 10) {
+            Text(bar).foregroundColor(color)
+            Text("\(current)/\(max)").foregroundColor(.white)
+        }
     }
 }
 
