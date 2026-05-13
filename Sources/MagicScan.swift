@@ -203,15 +203,17 @@ struct ContentView: View {
     /// under the memory ceiling (~150 MB if every floor were cached).
     private static let maxFloor = 100_000
     @State private var dungeonMap = DungeonMap.make(floor: 1)
-    /// Placeholder combat state. HP values stay at placeholders until
-    /// we rig proper combat numbers; the flee mechanic mutates them
-    /// symbolically (1 HP on crit fail / crit success) so the HUD bar
-    /// reacts.
-    @State private var playerHP: Int = 20
-    @State private var playerMaxHP: Int = 20
-    @State private var enemyHP: Int = 8
-    @State private var enemyMaxHP: Int = 8
-    @State private var enemyName: String = "Shade"
+    /// Combat state. Stats follow the locked 1-20 range; the damage
+    /// formula `max(1, attacker.str + d20 - defender.physDef)` drives
+    /// Fight. Player combat stats start at 1 to create headroom for
+    /// progression once items/leveling exist. HP and MP stay higher
+    /// so the early game isn't a one-hit ordeal.
+    @State private var playerStats: Stats = Stats(
+        hp: 20, maxHP: 20, mp: 10, maxMP: 10,
+        str: 1, spd: 1, physDef: 1, mag: 1, magDef: 1)
+    @State private var enemyStats: Stats = EnemyType.shade.baselineStats(floor: 1)
+    @State private var currentEnemyType: EnemyType = .shade
+    private var enemyName: String { currentEnemyType.displayName }
     /// True while a battle "event" is in progress. Stepping onto an
     /// enemy tile sets this; it stays true until the player flees
     /// successfully (Fight isn't wired yet). Map controls
@@ -220,10 +222,12 @@ struct ContentView: View {
     @State private var inBattle: Bool = false
     /// Index into `battleMenuOptions`. Driven by ↑/↓ during battle.
     @State private var battleMenuIndex: Int = 0
-    /// True between "Flee selected" and "the d20 settled." The next
-    /// dieResult publish in this window is interpreted as the flee
-    /// outcome.
-    @State private var awaitingFleeRoll: Bool = false
+    /// What action the next die roll resolves, or nil if no roll is
+    /// pending. Set when the player confirms a menu option that needs
+    /// a roll (Fight or Flee); cleared as soon as `dieResult` settles
+    /// and `handleRollResult` consumes it.
+    @State private var pendingRoll: PendingRoll? = nil
+    private var awaitingRoll: Bool { pendingRoll != nil }
     /// True between "the d20 settled" and "battle resolves." Gives
     /// the player a beat to actually see the rolled face before the
     /// fight view fades. All battle inputs are inert during this
@@ -232,6 +236,23 @@ struct ContentView: View {
     /// How long the settled die stays on screen post-roll. Long
     /// enough to read the face; short enough not to feel sluggish.
     private static let postRollHoldSeconds: Double = 1.5
+    /// Set when the fight-start transition (pixel shatter + ENGAGE
+    /// flash) is playing. Non-nil = transition in progress. All
+    /// inputs are blocked during the window so the player can't act
+    /// on a UI they can't see.
+    @State private var fightTransitionStart: Date? = nil
+    /// Set the moment damage lands (not on whiffs). Drives the white
+    /// flash overlay + screen shake for ~0.3s, then clears itself.
+    @State private var hitImpactStart: Date? = nil
+    /// Set the moment an enemy's HP drops to 0. FightView3D watches
+    /// this to play the wireframe explosion before the fight view
+    /// fades out.
+    @State private var defeatedEnemyAt: Date? = nil
+    /// Increments each time a new battle starts. FightView3D uses
+    /// this as a reset signal so a previous battle's exploded enemy
+    /// snaps back to full scale/opacity before the next battle's
+    /// pixel-shatter transition lifts.
+    @State private var battleEpoch: Int = 0
     /// Every floor the player has ever visited, keyed by floor
     /// number. On any stairs transition we save the current map into
     /// the cache and restore the target floor if it's there, so
@@ -263,6 +284,13 @@ struct ContentView: View {
         return dungeonMap.tiles[r][c].kind == .enemy
     }
 
+    /// Fires on any move that changes the player's tile (including
+    /// floor changes via stairs). Used as the trigger for entering a
+    /// battle so direct enemy-to-enemy steps don't get skipped.
+    private var playerPositionKey: String {
+        "\(dungeonMap.floor)/\(dungeonMap.playerRow),\(dungeonMap.playerCol)"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if dieKind == DieKind.d20.rawValue {
@@ -288,19 +316,23 @@ struct ContentView: View {
         .onKeyPress(.rightArrow, phases: [.down, .repeat]) { handleArrow(.right, phase: $0.phase) }
         .onKeyPress(.space, phases: [.down, .up]) { handleSpace($0.phase) }
         .onKeyPress(.return)     { handleInteract() }
-        .onChange(of: isOnEnemyTile) { newValue in
+        .onChange(of: playerPositionKey) { _ in
             // Drop shake state if we leave the tile mid-press.
-            if !newValue { shakingDie = false }
-            // Stepping onto an enemy starts a battle event; map
-            // controls are blocked until the player flees out.
-            if newValue && !inBattle { startBattle() }
+            if !isOnEnemyTile { shakingDie = false }
+            // Triggering on the position key (not on isOnEnemyTile)
+            // catches the case where a successful flee leaves the
+            // player on an enemy tile and they then step *directly*
+            // to an adjacent enemy — isOnEnemyTile stays true so an
+            // onChange watcher on it wouldn't fire.
+            if isOnEnemyTile && !inBattle && fightTransitionStart == nil {
+                startBattle()
+            }
         }
         .onChange(of: camera.dieResult) { newValue in
-            // The only roll we care about right now is the flee roll
-            // (Fight is locked). When the die settles and we asked
-            // for a flee, apply the outcome.
-            guard let result = newValue, awaitingFleeRoll else { return }
-            handleFleeResult(result)
+            // When the die settles and we have a pending roll (Fight
+            // or Flee), apply the outcome. Other rolls are ignored.
+            guard let result = newValue, awaitingRoll else { return }
+            handleRollResult(result)
         }
         .onAppear {
             // The camera is acquired by individual views that need it
@@ -328,14 +360,16 @@ struct ContentView: View {
     private enum ArrowDir { case up, down, left, right }
 
     private func handleArrow(_ dir: ArrowDir, phase: KeyPress.Phases) -> KeyPress.Result {
+        // Block all input while the fight-start transition is playing.
+        if fightTransitionStart != nil { return .handled }
         // While a battle event is running, arrows drive the menu
         // instead of the map. Left/right have no menu meaning yet, so
-        // they no-op. During the die-roll sub-phase (awaitingFleeRoll)
-        // all arrows are inert so they can't accidentally cancel the
-        // roll.
+        // they no-op. During an active die-roll (awaitingRoll) or its
+        // resolve hold, all arrows are inert so they can't accidentally
+        // cancel the roll.
         if inBattle {
             guard phase.contains(.down) else { return .handled }
-            if awaitingFleeRoll || resolvingRoll { return .handled }
+            if awaitingRoll || resolvingRoll { return .handled }
             switch dir {
             case .up:
                 battleMenuIndex = (battleMenuIndex + battleMenuOptions.count - 1)
@@ -366,8 +400,9 @@ struct ContentView: View {
     }
 
     private func handleInteract() -> KeyPress.Result {
+        if fightTransitionStart != nil { return .handled }
         if inBattle && resolvingRoll { return .handled }
-        if inBattle && !awaitingFleeRoll {
+        if inBattle && !awaitingRoll {
             confirmMenuSelection()
             return .handled
         }
@@ -422,12 +457,13 @@ struct ContentView: View {
     /// Always clears `shakingDie` on .up so a release in the wrong
     /// phase can't leave the die stuck mid-shake.
     private func handleSpace(_ phase: KeyPress.Phases) -> KeyPress.Result {
+        if fightTransitionStart != nil { return .handled }
         let down = phase.contains(.down)
         let up = phase.contains(.up)
         if up { shakingDie = false }
         if inBattle {
             if resolvingRoll { return .handled }
-            if awaitingFleeRoll {
+            if awaitingRoll {
                 if down { shakingDie = true }
                 return .handled
             }
@@ -440,12 +476,23 @@ struct ContentView: View {
 
     // MARK: - Battle event
 
-    /// Phantasy-Star-style action menu. Only Flee is wired up right
-    /// now; the other three log "not yet available" on confirm so
-    /// they read as planned-but-inactive.
+    /// Phantasy-Star-style action menu. Item and Hack are still
+    /// placeholders; Fight and Flee both kick off die rolls and
+    /// resolve via `handleRollResult`.
+    /// Prompt shown in the bottom-right of the battle HUD when a die
+    /// roll is pending. Distinguishes Fight from Flee so the player
+    /// knows what they're about to roll for.
+    private var rollPromptText: String {
+        switch pendingRoll {
+        case .attack: return "ROLL THE DIE TO STRIKE\nHOLD SPACE — RELEASE TO THROW"
+        case .flee:   return "ROLL THE DIE TO FLEE\nHOLD SPACE — RELEASE TO THROW"
+        case .none:   return ""
+        }
+    }
+
     private var battleMenuOptions: [BattleMenuOption] {
         [
-            BattleMenuOption(name: "Fight", enabled: false),
+            BattleMenuOption(name: "Fight", enabled: true),
             BattleMenuOption(name: "Item",  enabled: false),
             BattleMenuOption(name: "Hack",  enabled: false),
             BattleMenuOption(name: "Flee",  enabled: true),
@@ -455,14 +502,33 @@ struct ContentView: View {
     private func startBattle() {
         inBattle = true
         battleMenuIndex = 0
-        awaitingFleeRoll = false
+        pendingRoll = nil
         keyboardFocused = true
+        // Roll fresh enemy stats per encounter, scaled to the current
+        // floor. Same enemy type for now (only Shade exists); add the
+        // type-selection roll when there are more enemies to draw from.
+        enemyStats = currentEnemyType.baselineStats(floor: dungeonMap.floor)
+        // New battle: clear the previous defeat marker and bump the
+        // epoch so FightView3D resets any exploded enemy state.
+        defeatedEnemyAt = nil
+        hitImpactStart = nil
+        battleEpoch += 1
         camera.appendGameMessage("\(enemyName.uppercased()) bars your path. Battle!")
+        // Kick off the pixel-shatter + ENGAGE intro and clear the
+        // flag when it finishes. Battle inputs gate on this so the
+        // player can't shake the die before the overlay clears.
+        let start = Date()
+        fightTransitionStart = start
+        DispatchQueue.main.asyncAfter(deadline: .now() + BattleTransitionView.totalDuration) {
+            // Only clear if a fresh transition hasn't started in the
+            // meantime (defensive — shouldn't happen mid-battle).
+            if fightTransitionStart == start { fightTransitionStart = nil }
+        }
     }
 
     private func endBattle() {
         inBattle = false
-        awaitingFleeRoll = false
+        pendingRoll = nil
         shakingDie = false
     }
 
@@ -473,42 +539,126 @@ struct ContentView: View {
             return
         }
         switch opt.name {
+        case "Fight":
+            pendingRoll = .attack
+            camera.appendGameMessage("You ready a strike. Roll the die — hold SPACE, release to throw.")
         case "Flee":
-            awaitingFleeRoll = true
+            pendingRoll = .flee
             camera.appendGameMessage("You move to flee. Roll the die — hold SPACE, release to throw.")
         default:
             break
         }
     }
 
-    private func handleFleeResult(_ roll: Int) {
-        awaitingFleeRoll = false
+    /// Single dispatch point for every die roll resolved inside a
+    /// battle. `pendingRoll` decided what was being attempted; this
+    /// applies the outcome and decides whether the battle ends.
+    private func handleRollResult(_ roll: Int) {
+        guard let kind = pendingRoll, !resolvingRoll else { return }
         resolvingRoll = true
-        var success = false
-        switch roll {
-        case 1:
-            playerHP = max(0, playerHP - 3)
-            camera.appendGameMessage("CRITICAL FAIL — \(enemyName) catches you. You take 3 damage.")
-        case 2...10:
-            playerHP = max(0, playerHP - 1)
-            camera.appendGameMessage("You roll \(roll). You fail to escape and take 1 damage.")
-        case 11...19:
-            camera.appendGameMessage("You roll \(roll). You break away and escape!")
-            success = true
-        case 20:
-            enemyHP = max(0, enemyHP - 1)
-            camera.appendGameMessage("CRITICAL SUCCESS — A parting blow lands! You escape and \(enemyName) takes 1 damage.")
-            success = true
-        default:
-            camera.appendGameMessage("You roll \(roll). The result is unclear.")
+        var endsBattle = false
+        switch kind {
+        case .attack:
+            // Locked damage formula (d6 base):
+            //   damage = max(1, str + roll - physDef) + crit-bonus
+            // Roll 1 = critical miss (skips clamp, zero damage).
+            // Roll 6 = critical hit (adds flat +2 on top of the
+            // normal calc). Both produce extra log flavor.
+            if roll == 1 {
+                camera.appendGameMessage("CRITICAL MISS! You roll 1. Your strike goes wide.")
+            } else {
+                let isCrit = (roll == 6)
+                let base = playerStats.str + roll - enemyStats.physDef
+                let damage = max(1, base + (isCrit ? 2 : 0))
+                enemyStats.hp = max(0, enemyStats.hp - damage)
+                let prefix = isCrit ? "CRITICAL HIT! " : ""
+                let critTag = isCrit ? " + 2 crit" : ""
+                camera.appendGameMessage(
+                    "\(prefix)You roll \(roll). You strike \(enemyName) for \(damage) damage. (STR \(playerStats.str) + \(roll) − PDF \(enemyStats.physDef)\(critTag))"
+                )
+                triggerHitImpact()
+                if enemyStats.hp == 0 {
+                    camera.appendGameMessage("\(enemyName.uppercased()) collapses. The path is clear.")
+                    clearDefeatedEnemyTile()
+                    defeatedEnemyAt = Date()
+                    endsBattle = true
+                }
+            }
+        case .flee:
+            switch roll {
+            case 1:
+                playerStats.hp = max(0, playerStats.hp - 3)
+                camera.appendGameMessage("CRITICAL FAIL — \(enemyName) catches you. You take 3 damage.")
+            case 2...10:
+                playerStats.hp = max(0, playerStats.hp - 1)
+                camera.appendGameMessage("You roll \(roll). You fail to escape and take 1 damage.")
+            case 11...19:
+                camera.appendGameMessage("You roll \(roll). You break away and escape!")
+                endsBattle = true
+            case 20:
+                enemyStats.hp = max(0, enemyStats.hp - 1)
+                camera.appendGameMessage("CRITICAL SUCCESS — A parting blow lands! You escape and \(enemyName) takes 1 damage.")
+                endsBattle = true
+            default:
+                camera.appendGameMessage("You roll \(roll). The result is unclear.")
+            }
         }
-        // Hold the settled die on screen briefly. On success, this
-        // also delays the fade back to the dungeon — without it the
-        // result is gone before the player can read the face.
+        // Hold the settled die so the player can read the face; on
+        // battle-ending rolls this also gates the fade-out. Keep
+        // `pendingRoll` set during the hold so the orb's die-kind
+        // override doesn't flip back mid-display.
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.postRollHoldSeconds) {
             resolvingRoll = false
-            if success { endBattle() }
+            pendingRoll = nil
+            if endsBattle { endBattle() }
         }
+    }
+
+    /// Kick off the white-flash + screen-shake feedback that plays
+    /// whenever damage actually lands. Auto-clears after 0.3s so the
+    /// driving TimelineView pauses again.
+    private func triggerHitImpact() {
+        let start = Date()
+        hitImpactStart = start
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) {
+            if hitImpactStart == start { hitImpactStart = nil }
+        }
+    }
+
+    /// Computes the current flash opacity and shake offset for the
+    /// fight ZStack. The TimelineView wrapping the ZStack feeds in
+    /// the current frame's `Date` and pauses when no impact is
+    /// pending so this isn't hot in the steady state.
+    private func impactValues(now: Date) -> (flash: Double, shake: CGSize) {
+        guard let start = hitImpactStart else { return (0, .zero) }
+        let elapsed = now.timeIntervalSince(start)
+        let flashDur: Double = 0.15
+        let shakeDur: Double = 0.22
+        let flash: Double = elapsed < flashDur
+            ? max(0, 1 - elapsed / flashDur) * 0.55  // peak ~55% white
+            : 0
+        let shake: CGSize
+        if elapsed < shakeDur {
+            let damping = 1.0 - (elapsed / shakeDur)
+            let intensity = 7.0 * damping
+            let angle = elapsed * 80
+            shake = CGSize(width: cos(angle) * intensity,
+                           height: sin(angle * 1.4) * intensity * 0.6)
+        } else {
+            shake = .zero
+        }
+        return (flash, shake)
+    }
+
+    /// Convert the tile the player is standing on from `.enemy` to
+    /// `.empty` after a Fight victory. Used so a dead enemy doesn't
+    /// keep re-triggering battles when the player walks away and
+    /// back. Flee victories don't call this — the enemy is still
+    /// alive on its tile.
+    private func clearDefeatedEnemyTile() {
+        let r = dungeonMap.playerRow, c = dungeonMap.playerCol
+        guard dungeonMap.tiles[r][c].kind == .enemy else { return }
+        dungeonMap.tiles[r][c].kind = .empty
     }
 
     private func logStep(_ kind: DungeonTileKind?) {
@@ -532,6 +682,45 @@ struct ContentView: View {
         .onDisappear { camera.release() }
     }
 
+    /// Inner ZStack for the dungeon/fight scene, including the
+    /// hit-flash and screen-shake driven by `now`. Extracted from
+    /// `dungeonView3D` because the combined expression confused
+    /// SwiftUI's generic inference when wrapped in TimelineView.
+    @ViewBuilder
+    private func fightLayerStack(at now: Date) -> some View {
+        let (flashAlpha, shake) = impactValues(now: now)
+        ZStack {
+            DungeonView3D(map: dungeonMap)
+                .opacity(inBattle ? 0 : 1)
+                .allowsHitTesting(!inBattle)
+            FightView3D(battleEpoch: battleEpoch,
+                         defeatedAt: defeatedEnemyAt)
+                .opacity(inBattle ? 1 : 0)
+                .allowsHitTesting(inBattle)
+            BattleHUD(enemyName: enemyName,
+                      enemyHP: enemyStats.hp, enemyMaxHP: enemyStats.maxHP,
+                      playerHP: playerStats.hp, playerMaxHP: playerStats.maxHP,
+                      menu: battleMenuOptions,
+                      menuIndex: battleMenuIndex,
+                      awaitingRoll: awaitingRoll,
+                      rollPrompt: rollPromptText,
+                      resolvingRoll: resolvingRoll,
+                      rollValue: camera.dieResult)
+                .opacity(inBattle ? 1 : 0)
+                .allowsHitTesting(false)
+            if let started = fightTransitionStart {
+                BattleTransitionView(startedAt: started)
+                    .allowsHitTesting(false)
+            }
+            // Hit flash — drawn last so it sits over HUD too.
+            Rectangle()
+                .fill(Color.white)
+                .opacity(flashAlpha)
+                .allowsHitTesting(false)
+        }
+        .offset(shake)
+    }
+
     private func dungeonView3D() -> some View {
         // Keep both 3D scenes in the view hierarchy at all times and
         // swap via opacity instead of an if/else conditional. SceneKit
@@ -541,25 +730,15 @@ struct ContentView: View {
         // Building it at launch warms the shader cache so the swap
         // is instant.
         standardOverlays(
-            ZStack {
-                DungeonView3D(map: dungeonMap)
-                    .opacity(inBattle ? 0 : 1)
-                    .allowsHitTesting(!inBattle)
-                FightView3D()
-                    .opacity(inBattle ? 1 : 0)
-                    .allowsHitTesting(inBattle)
-                BattleHUD(enemyName: enemyName,
-                          enemyHP: enemyHP, enemyMaxHP: enemyMaxHP,
-                          playerHP: playerHP, playerMaxHP: playerMaxHP,
-                          menu: battleMenuOptions,
-                          menuIndex: battleMenuIndex,
-                          awaitingFleeRoll: awaitingFleeRoll,
-                          resolvingRoll: resolvingRoll,
-                          rollValue: camera.dieResult)
-                    .opacity(inBattle ? 1 : 0)
-                    .allowsHitTesting(false)
+            TimelineView(.animation(minimumInterval: 1.0/60.0,
+                                     paused: hitImpactStart == nil)) { ctx in
+                fightLayerStack(at: ctx.date)
             },
-            embedOrb: inBattle
+            // Only show the die window when a roll is actually
+            // pending or resolving — otherwise the d20 sits there
+            // during menu nav and visibly swaps to a d6 the moment
+            // FIGHT is chosen, which reads as a glitch.
+            embedOrb: awaitingRoll || resolvingRoll
         )
         .overlay(alignment: .bottomLeading) {
             // Hide the on-screen turn buttons in arrow-keys mode (←/→
@@ -571,6 +750,23 @@ struct ContentView: View {
                     turnButton("▶") { dungeonMap.turn(by: 1) }
                 }
                 .padding(24)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            // Debug-only: inspect both combatants' stat blocks during
+            // a battle. Not part of the shipping UI — strip when
+            // combat balance settles.
+            if inBattle {
+                HStack(alignment: .top, spacing: 10) {
+                    DebugPlayerStatsView(stats: playerStats)
+                        .frame(width: 120)
+                    DebugEnemyStatsView(name: enemyName,
+                                         stats: enemyStats,
+                                         floor: dungeonMap.floor)
+                        .frame(width: 120)
+                }
+                .padding(.top, 20)
+                .padding(.trailing, 20)
             }
         }
     }
@@ -585,6 +781,14 @@ struct ContentView: View {
                 .background(.black.opacity(0.55), in: Circle())
         }
         .buttonStyle(.plain)
+    }
+
+    /// What die the embedded orb should display. nil means "user's
+    /// preference" (Adventure mode → d20). During Fight rolls we
+    /// override to d6 so the dice progression can grow via pool size
+    /// rather than die size.
+    private var embeddedOrbDieKindOverride: String? {
+        pendingRoll == .attack ? DieKind.d6.rawValue : nil
     }
 
     @ViewBuilder
@@ -604,7 +808,8 @@ struct ContentView: View {
                         .background(.black.opacity(0.6), in: Capsule())
                     }
                     if embedOrb {
-                        EmbeddedOrbView(shaking: shakingDie)
+                        EmbeddedOrbView(shaking: shakingDie,
+                                        dieKindOverride: embeddedOrbDieKindOverride)
                             .environmentObject(camera)
                             .frame(width: 180, height: 180)
                     }
@@ -1379,6 +1584,23 @@ struct DungeonView3D: NSViewRepresentable {
 /// through the die-roll overlay the parent view layers on top of this
 /// scene — this view is the *backdrop* for the fight, not its logic.
 struct FightView3D: NSViewRepresentable {
+    /// Bumped by the parent on every new battle. The coordinator
+    /// compares against `lastEpoch` and resets the enemy node's
+    /// scale/opacity so a previous battle's explosion doesn't bleed
+    /// into the next encounter.
+    var battleEpoch: Int = 0
+    /// Set when the player kills the enemy. The coordinator notices
+    /// the new timestamp and runs the wireframe-explode animation.
+    var defeatedAt: Date? = nil
+
+    final class Coordinator {
+        weak var enemyNode: SCNNode?
+        var lastEpoch: Int = -1
+        var lastDefeatTrigger: Date? = nil
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> SCNView {
         let view = SCNView()
         view.backgroundColor = .black
@@ -1401,15 +1623,46 @@ struct FightView3D: NSViewRepresentable {
         scene.rootNode.addChildNode(camNode)
 
         addFloorGrid(to: scene)
-        addEnemy(to: scene)
+        context.coordinator.enemyNode = addEnemy(to: scene)
         addPlayerSilhouette(to: scene)
 
         view.scene = scene
+        context.coordinator.lastEpoch = battleEpoch
         return view
     }
 
     func updateNSView(_ nsView: SCNView, context: Context) {
-        // Static tableau — no per-frame state yet.
+        let coord = context.coordinator
+        // New battle: snap the enemy back to fresh pose.
+        if battleEpoch != coord.lastEpoch {
+            coord.lastEpoch = battleEpoch
+            resetEnemy(coord.enemyNode)
+        }
+        // Enemy defeated: animate the wireframe disintegration.
+        if let trigger = defeatedAt, trigger != coord.lastDefeatTrigger {
+            coord.lastDefeatTrigger = trigger
+            explodeEnemy(coord.enemyNode)
+        }
+    }
+
+    /// Scale-up + fade-out the enemy node over ~0.5s — fits inside
+    /// the existing 1.5s post-roll hold so the player sees the
+    /// wireframe blow apart before the fight view fades.
+    private func explodeEnemy(_ node: SCNNode?) {
+        guard let node = node else { return }
+        node.removeAllActions()
+        let scaleUp = SCNAction.scale(to: 1.6, duration: 0.5)
+        let fadeOut = SCNAction.fadeOut(duration: 0.5)
+        let group = SCNAction.group([scaleUp, fadeOut])
+        group.timingMode = .easeOut
+        node.runAction(group)
+    }
+
+    private func resetEnemy(_ node: SCNNode?) {
+        guard let node = node else { return }
+        node.removeAllActions()
+        node.scale = SCNVector3(1, 1, 1)
+        node.opacity = 1
     }
 
     /// Receding floor grid for spatial context. Tron green, matching
@@ -1439,7 +1692,9 @@ struct FightView3D: NSViewRepresentable {
 
     /// Humanoid enemy wireframe at world origin, facing the camera.
     /// Cyan so it matches the dungeon's existing enemy color.
-    private func addEnemy(to scene: SCNScene) {
+    /// Returns the node so the coordinator can animate it later.
+    @discardableResult
+    private func addEnemy(to scene: SCNScene) -> SCNNode? {
         var segs: [(SIMD3<Float>, SIMD3<Float>)] = []
         DungeonView3D.addBoxEdges(to: &segs,
                                    center: SIMD3(0, 1.55, 0),
@@ -1458,9 +1713,12 @@ struct FightView3D: NSViewRepresentable {
         segs.append((SIMD3(-0.15, 1.6, 0.2), SIMD3(-0.05, 1.6, 0.2)))
         segs.append((SIMD3(0.05, 1.6, 0.2),  SIMD3(0.15, 1.6, 0.2)))
         let color = NSColor(calibratedRed: 0.00, green: 0.95, blue: 1.00, alpha: 1)
-        if let g = DungeonView3D.buildLineGeometry(segments: segs, color: color) {
-            scene.rootNode.addChildNode(SCNNode(geometry: g))
+        guard let g = DungeonView3D.buildLineGeometry(segments: segs, color: color) else {
+            return nil
         }
+        let node = SCNNode(geometry: g)
+        scene.rootNode.addChildNode(node)
+        return node
     }
 
     /// The player's upper body from behind, parked between the camera
@@ -1497,9 +1755,255 @@ struct FightView3D: NSViewRepresentable {
     }
 }
 
+enum PendingRoll {
+    case attack
+    case flee
+}
+
+/// Combat stat block, shared by player and enemies. Stat range is
+/// 1-20; the d20 you roll IS the attack roll, so stats act as
+/// modifiers (D&D-flavored). Defense is split into physical and
+/// magical; magic costs MP.
+struct Stats {
+    var hp: Int
+    var maxHP: Int
+    var mp: Int
+    var maxMP: Int
+    var str: Int     // physical attack
+    var spd: Int     // turn order / dodge
+    var physDef: Int
+    var mag: Int     // magic attack
+    var magDef: Int
+}
+
+/// Per-type enemy stat baselines. Add cases as new enemies arrive;
+/// `baselineStats(floor:)` mixes in a small depth bump so the same
+/// enemy at floor 30 hits harder than at floor 1 without needing a
+/// per-floor table.
+enum EnemyType {
+    case shade
+
+    var displayName: String {
+        switch self {
+        case .shade: return "Shade"
+        }
+    }
+
+    func baselineStats(floor: Int) -> Stats {
+        let bump = max(0, (floor - 1) / 3)
+        switch self {
+        case .shade:
+            return Stats(
+                hp: 8 + bump, maxHP: 8 + bump,
+                mp: 4 + bump, maxMP: 4 + bump,
+                str: 4 + bump, spd: 6 + bump,
+                physDef: 3 + bump, mag: 6 + bump, magDef: 3 + bump
+            )
+        }
+    }
+}
+
 struct BattleMenuOption {
     let name: String
     let enabled: Bool
+}
+
+/// Debug-only player stat block, sibling to `DebugEnemyStatsView`.
+/// Green accent so it visually pairs with the green player HP bar in
+/// the BattleHUD. Not intended to ship.
+struct DebugPlayerStatsView: View {
+    let stats: Stats
+
+    private static let accent = Color(red: 0.30, green: 0.95, blue: 0.55)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("DEBUG · HERO")
+                .foregroundColor(Self.accent)
+            Divider().background(Color.white.opacity(0.2))
+            statLine("HP",  cur: stats.hp,  max: stats.maxHP)
+            statLine("MP",  cur: stats.mp,  max: stats.maxMP)
+            statLine("STR", value: stats.str)
+            statLine("SPD", value: stats.spd)
+            statLine("PDF", value: stats.physDef)
+            statLine("MAG", value: stats.mag)
+            statLine("MDF", value: stats.magDef)
+        }
+        .font(.system(.caption, design: .monospaced).weight(.semibold))
+        .foregroundColor(Color(white: 0.88))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Self.accent.opacity(0.45), lineWidth: 1)
+        )
+    }
+
+    private func statLine(_ label: String, cur: Int, max: Int) -> some View {
+        Text("\(label)  \(cur)/\(max)")
+    }
+    private func statLine(_ label: String, value: Int) -> some View {
+        Text("\(label)  \(value)")
+    }
+}
+
+/// Debug-only overlay listing the enemy's full stat block. Lives in
+/// the upper-right of the battle view so we can sanity-check stat
+/// scaling and damage formulas while tuning. Not intended to ship.
+struct DebugEnemyStatsView: View {
+    let name: String
+    let stats: Stats
+    let floor: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("DEBUG · F\(floor)")
+                .foregroundColor(Color(red: 1.0, green: 0.85, blue: 0.30))
+            Text(name.uppercased())
+                .foregroundColor(.white)
+            Divider().background(Color.white.opacity(0.2))
+            statLine("HP",  cur: stats.hp,  max: stats.maxHP)
+            statLine("MP",  cur: stats.mp,  max: stats.maxMP)
+            statLine("STR", value: stats.str)
+            statLine("SPD", value: stats.spd)
+            statLine("PDF", value: stats.physDef)
+            statLine("MAG", value: stats.mag)
+            statLine("MDF", value: stats.magDef)
+        }
+        .font(.system(.caption, design: .monospaced).weight(.semibold))
+        .foregroundColor(Color(white: 0.88))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color(red: 1.0, green: 0.85, blue: 0.30).opacity(0.45), lineWidth: 1)
+        )
+    }
+
+    private func statLine(_ label: String, cur: Int, max: Int) -> some View {
+        Text("\(label)  \(cur)/\(max)")
+    }
+    private func statLine(_ label: String, value: Int) -> some View {
+        Text("\(label)  \(value)")
+    }
+}
+
+/// Fight-start sting: the screen shatters into a grid of randomly
+/// colored neon cells, the word ENGAGE flashes in the middle, then
+/// the cells dissolve back out to reveal the fight view. Runs entirely
+/// off a `TimelineView` driving a single `Canvas` draw so 600+ cells
+/// stay cheap. Time-driven (not state-driven) so the animation is
+/// deterministic regardless of view rebuilds.
+struct BattleTransitionView: View {
+    let startedAt: Date
+
+    /// Phase durations (seconds). Tuning constants — feel free to
+    /// nudge for pacing.
+    static let shatterDuration: Double = 0.32
+    static let holdDuration: Double = 0.55
+    static let dissolveDuration: Double = 0.42
+    static var totalDuration: Double {
+        shatterDuration + holdDuration + dissolveDuration
+    }
+
+    private static let cols = 32
+    private static let rows = 18
+    private static let cellCount = cols * rows
+
+    private static let palette: [Color] = [
+        Color(red: 0.20, green: 1.00, blue: 0.50),  // floor green
+        Color(red: 0.00, green: 0.95, blue: 1.00),  // enemy cyan
+        Color(red: 1.00, green: 0.55, blue: 0.20),  // wall amber
+        Color(red: 0.45, green: 0.80, blue: 1.00),  // door blue
+        Color(red: 0.95, green: 0.30, blue: 0.30),  // hp red
+        Color(white: 0.04),
+        Color(white: 0.04),                          // weight black higher so the screen doesn't look like confetti
+    ]
+
+    /// Per-cell stagger (0…1) and color. Lives in @State so the
+    /// random pattern is generated *once* when the view appears and
+    /// stays stable across the TimelineView re-renders that drive
+    /// the animation. If these were stored as `let` properties on the
+    /// struct, SwiftUI would re-init the view (and re-roll the
+    /// random values) on every parent body eval, turning the shatter
+    /// into incoherent flicker.
+    @State private var cellDelays: [Double] = (0..<BattleTransitionView.cellCount)
+        .map { _ in Double.random(in: 0...0.85) }
+    @State private var cellColors: [Color] = (0..<BattleTransitionView.cellCount)
+        .map { _ in BattleTransitionView.palette.randomElement() ?? .black }
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let elapsed = context.date.timeIntervalSince(startedAt)
+            ZStack {
+                Canvas { ctx, size in
+                    let cellW = size.width / Double(Self.cols)
+                    let cellH = size.height / Double(Self.rows)
+                    for i in 0..<Self.cellCount {
+                        let opacity = cellOpacity(elapsed: elapsed, delay: cellDelays[i])
+                        guard opacity > 0.01 else { continue }
+                        let r = i / Self.cols
+                        let c = i % Self.cols
+                        let rect = CGRect(x: Double(c) * cellW,
+                                          y: Double(r) * cellH,
+                                          width: cellW, height: cellH)
+                        ctx.fill(Path(rect),
+                                 with: .color(cellColors[i].opacity(opacity)))
+                    }
+                }
+                Text("ENGAGE")
+                    .font(.system(size: 96, weight: .black, design: .monospaced))
+                    .kerning(8)
+                    .foregroundColor(Color(red: 1.00, green: 0.95, blue: 0.40))
+                    .shadow(color: Color(red: 1, green: 0.55, blue: 0).opacity(0.85),
+                            radius: 16)
+                    .opacity(engageOpacity(elapsed: elapsed))
+            }
+        }
+    }
+
+    private func cellOpacity(elapsed: Double, delay: Double) -> Double {
+        let shatterEnd = Self.shatterDuration
+        let holdEnd = shatterEnd + Self.holdDuration
+        let dissolveEnd = holdEnd + Self.dissolveDuration
+        if elapsed < 0 { return 0 }
+        if elapsed < shatterEnd {
+            // Cells pop in over a fraction of the shatter window
+            // staggered by their random delay.
+            let cellStart = delay * Self.shatterDuration * 0.55
+            let cellElapsed = elapsed - cellStart
+            if cellElapsed <= 0 { return 0 }
+            let fadeIn = Self.shatterDuration * 0.45
+            return min(1, cellElapsed / fadeIn)
+        }
+        if elapsed < holdEnd { return 1 }
+        if elapsed < dissolveEnd {
+            let cellStart = delay * Self.dissolveDuration * 0.55
+            let cellElapsed = elapsed - holdEnd - cellStart
+            if cellElapsed <= 0 { return 1 }
+            let fadeOut = Self.dissolveDuration * 0.45
+            return max(0, 1 - cellElapsed / fadeOut)
+        }
+        return 0
+    }
+
+    private func engageOpacity(elapsed: Double) -> Double {
+        let shatterEnd = Self.shatterDuration
+        let dissolveEnd = shatterEnd + Self.holdDuration + Self.dissolveDuration
+        if elapsed < shatterEnd { return 0 }
+        let fadeIn: Double = 0.10
+        if elapsed < shatterEnd + fadeIn {
+            return (elapsed - shatterEnd) / fadeIn
+        }
+        let fadeOutStart = dissolveEnd - 0.18
+        if elapsed < fadeOutStart { return 1 }
+        if elapsed < dissolveEnd {
+            return max(0, 1 - (elapsed - fadeOutStart) / 0.18)
+        }
+        return 0
+    }
 }
 
 /// Phantasy-Star-style combat readout: enemy strip at the top, player
@@ -1514,7 +2018,8 @@ struct BattleHUD: View {
     let playerMaxHP: Int
     let menu: [BattleMenuOption]
     let menuIndex: Int
-    let awaitingFleeRoll: Bool
+    let awaitingRoll: Bool
+    let rollPrompt: String
     let resolvingRoll: Bool
     let rollValue: Int?
 
@@ -1542,8 +2047,8 @@ struct BattleHUD: View {
                     if resolvingRoll {
                         Text(rollValue.map { "ROLLED \($0)" } ?? "ROLLED")
                             .foregroundColor(Self.selectColor)
-                    } else if awaitingFleeRoll {
-                        Text("ROLL THE DIE TO FLEE\nHOLD SPACE — RELEASE TO THROW")
+                    } else if awaitingRoll {
+                        Text(rollPrompt)
                             .multilineTextAlignment(.trailing)
                             .foregroundColor(Self.selectColor)
                     } else {
@@ -2353,13 +2858,20 @@ struct OrbView: View {
 /// Adventure mode — `shaking` mirrors the spacebar's pressed state.
 struct EmbeddedOrbView: View {
     let shaking: Bool
+    /// When non-nil, supersedes the user's `dieKind` preference for
+    /// this orb. Used to force a d6 during attack rolls while the
+    /// player's Adventure-mode default stays d20 for Flee.
+    var dieKindOverride: String? = nil
     @EnvironmentObject var camera: CameraController
     @AppStorage(DieKind.storageKey) private var dieKind: String = DieKind.d6.rawValue
 
+    private var activeKind: String { dieKindOverride ?? dieKind }
+
     var body: some View {
         OrbSceneView(camera: camera, hand: camera.hands.first,
-                     keyboardMode: true, keyboardShaking: shaking)
-            .id(dieKind)
+                     keyboardMode: true, keyboardShaking: shaking,
+                     dieKindOverride: dieKindOverride)
+            .id(activeKind)
             .background(Color(white: 0.04))
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .overlay {
@@ -2383,8 +2895,22 @@ struct OrbSceneView: NSViewRepresentable {
     /// Parent-controlled "is the user holding the shake key?" flag.
     /// Only consulted when keyboardMode is true.
     var keyboardShaking: Bool = false
+    /// Per-instance override for which die geometry/face-count to
+    /// use. When nil, falls back to `DieKind.current` (the user's
+    /// AppStorage preference). Used to render a d6 for Fight rolls
+    /// while the Adventure-mode default stays d20 for Flee.
+    var dieKindOverride: String? = nil
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    private var activeKind: DieKind {
+        if let raw = dieKindOverride, let k = DieKind(rawValue: raw) { return k }
+        return .current
+    }
+
+    func makeCoordinator() -> Coordinator {
+        let c = Coordinator()
+        c.dieKind = activeKind
+        return c
+    }
 
     func makeNSView(context: Context) -> SCNView {
         let view = SCNView()
@@ -2394,12 +2920,13 @@ struct OrbSceneView: NSViewRepresentable {
         view.isPlaying = true
         view.rendersContinuously = true
 
-        let (scene, crystal, markers) = Self.buildScene()
+        let (scene, crystal, markers) = Self.buildScene(kind: activeKind)
         view.scene = scene
 
         context.coordinator.crystalNode = crystal
         context.coordinator.markerNodes = markers
         context.coordinator.camera = camera
+        context.coordinator.dieKind = activeKind
         view.delegate = context.coordinator
 
         return view
@@ -2409,12 +2936,14 @@ struct OrbSceneView: NSViewRepresentable {
         context.coordinator.targetHand = hand
         context.coordinator.keyboardMode = keyboardMode
         context.coordinator.keyboardShaking = keyboardShaking
+        context.coordinator.dieKind = activeKind
     }
 
     /// Returns (scene, dieNode, fingertipMarkers). Used by both the live
     /// SCNView and the offscreen recorder so recordings match the live
-    /// view.
-    static func buildScene() -> (SCNScene, SCNNode, [SCNNode]) {
+    /// view. `kind` controls which die geometry is built; default
+    /// keeps the old behavior of reading the user's preference.
+    static func buildScene(kind: DieKind = .current) -> (SCNScene, SCNNode, [SCNNode]) {
         let scene = SCNScene()
         scene.background.contents = NSColor(white: 0.04, alpha: 1)
 
@@ -2447,7 +2976,7 @@ struct OrbSceneView: NSViewRepresentable {
         amb.light?.intensity = 130
         scene.rootNode.addChildNode(amb)
 
-        let die = SCNNode(geometry: makeDieGeometry())
+        let die = SCNNode(geometry: makeDieGeometry(kind: kind))
         scene.rootNode.addChildNode(die)
 
         let markerColors: [NSColor] = [
@@ -2832,17 +3361,25 @@ struct OrbSceneView: NSViewRepresentable {
             }
         }
 
-        /// Pick a random face number from the current die kind that is
+        /// Pick a random face number from the active die kind that is
         /// NOT the given face. Guarantees the visual roll always lands
         /// on a different face than the one currently up, so even slow
-        /// throws produce a clear "the die changed" moment.
-        static func randomFaceExcluding(_ excluded: Int) -> Int {
-            let count = DieKind.current.faceCount
+        /// throws produce a clear "the die changed" moment. Instance
+        /// method (was static) so each Orb can drive a different die
+        /// kind — e.g., d6 for Fight, d20 for Flee.
+        func randomFaceExcluding(_ excluded: Int) -> Int {
+            let count = dieKind.faceCount
             guard count > 1 else { return 1 }
             var pick = Int.random(in: 1..<count)  // 1...count-1
             if pick >= excluded { pick += 1 }      // skip the excluded slot
             return pick
         }
+
+        /// Die kind this coordinator is currently driving. Pushed in
+        /// by `OrbSceneView.makeNSView` / `updateNSView` so face-count
+        /// math and orientation lookups always match the rendered
+        /// geometry.
+        var dieKind: DieKind = .d6
 
         weak var crystalNode: SCNNode?
         var markerNodes: [SCNNode] = []
@@ -3039,8 +3576,8 @@ struct OrbSceneView: NSViewRepresentable {
                     let rawLen = sqrt(raw.x * raw.x + raw.y * raw.y + raw.z * raw.z)
                     let axis = rawLen > 0.001 ? raw / rawLen : SIMD3<Float>(1, 0, 0)
                     angularVelocity = axis * speed
-                    rolledFace = Self.randomFaceExcluding(
-                        OrbSceneView.nearestFace(to: dieOrientation))
+                    rolledFace = randomFaceExcluding(
+                        OrbSceneView.nearestFace(to: dieOrientation, kind: dieKind))
                     dieResult = nil
                     dieState = .spinning
                     let firePath = pathA ? "A_growth" : "B_speed"
@@ -3055,8 +3592,8 @@ struct OrbSceneView: NSViewRepresentable {
                     // it. Lower starting angular velocity so the spin
                     // visibly differs from a "real" thrown roll, but
                     // still produces a fresh result every grip-release.
-                    let face = Self.randomFaceExcluding(
-                        OrbSceneView.nearestFace(to: dieOrientation))
+                    let face = randomFaceExcluding(
+                        OrbSceneView.nearestFace(to: dieOrientation, kind: dieKind))
                     let tumble = SIMD3<Float>(
                         Float.random(in: -1...1),
                         Float.random(in: -1...1),
@@ -3098,14 +3635,14 @@ struct OrbSceneView: NSViewRepresentable {
                     // orientation so the spin glides smoothly into the
                     // chosen face without a visible snap.
                     if let face = rolledFace, speed < 3 {
-                        let target = OrbSceneView.orientationFor(faceNumber: face)
+                        let target = OrbSceneView.orientationFor(faceNumber: face, kind: dieKind)
                         let approach = (3 - speed) / 3
                         let step = min(1, approach * dt * 6)
                         dieOrientation = simd_slerp(dieOrientation, target, step)
                     }
                 } else {
                     if let face = rolledFace {
-                        dieOrientation = OrbSceneView.orientationFor(faceNumber: face)
+                        dieOrientation = OrbSceneView.orientationFor(faceNumber: face, kind: dieKind)
                         dieResult = face
                         camera?.appendGameMessage("YOU ROLLED A \(face)")
                     }
@@ -3241,8 +3778,8 @@ struct OrbSceneView: NSViewRepresentable {
                     let len = simd_length(tumble)
                     let axis = len > 0.001 ? tumble / len : SIMD3<Float>(1, 0, 0)
                     angularVelocity = axis * throwTumbleSpeed
-                    let face = Self.randomFaceExcluding(
-                        OrbSceneView.nearestFace(to: dieOrientation))
+                    let face = randomFaceExcluding(
+                        OrbSceneView.nearestFace(to: dieOrientation, kind: dieKind))
                     rolledFace = face
                     dieState = .spinning
                     camera?.appendGameMessage("YOU ROLLED THE DIE")
@@ -3255,14 +3792,14 @@ struct OrbSceneView: NSViewRepresentable {
                     dieOrientation = simd_mul(dq, dieOrientation)
                     angularVelocity *= exp(-2.2 * dt)
                     if let face = rolledFace, speed < 3 {
-                        let target = OrbSceneView.orientationFor(faceNumber: face)
+                        let target = OrbSceneView.orientationFor(faceNumber: face, kind: dieKind)
                         let approach = (3 - speed) / 3
                         let step = min(1, approach * dt * 6)
                         dieOrientation = simd_slerp(dieOrientation, target, step)
                     }
                 } else {
                     if let face = rolledFace {
-                        dieOrientation = OrbSceneView.orientationFor(faceNumber: face)
+                        dieOrientation = OrbSceneView.orientationFor(faceNumber: face, kind: dieKind)
                         dieResult = face
                         camera?.appendGameMessage("YOU ROLLED A \(face)")
                     }
