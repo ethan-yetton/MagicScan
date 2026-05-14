@@ -248,6 +248,24 @@ struct ContentView: View {
     /// this to play the wireframe explosion before the fight view
     /// fades out.
     @State private var defeatedEnemyAt: Date? = nil
+    /// Bumped each time the enemy takes its turn. FightView3D watches
+    /// the new timestamp and runs the eye-glow windup + laser beam
+    /// animation. Damage and hit-impact are scheduled separately so
+    /// they land in sync with the beam fire.
+    @State private var enemyAttackAt: Date? = nil
+    /// Set the moment the laser visually lands. Drives the red
+    /// full-screen flash overlay + heavier shake — distinct from the
+    /// player's white hit-flash so the two reads don't clash.
+    @State private var enemyHitImpactStart: Date? = nil
+    /// True if the shade has already had its turn in the current
+    /// round. Speed gives one combatant initiative; whoever moves
+    /// first uses up that round's turn budget. Cleared the moment the
+    /// player picks a new action.
+    @State private var enemyActedThisRound: Bool = false
+    /// Set the moment the player's HP hits 0. Drives the GAME OVER
+    /// shatter outro; nil = normal play. SPACE while non-nil runs
+    /// `restartFromGameOver`. All other input is blocked.
+    @State private var gameOverStart: Date? = nil
     /// Increments each time a new battle starts. FightView3D uses
     /// this as a reset signal so a previous battle's exploded enemy
     /// snaps back to full scale/opacity before the next battle's
@@ -360,8 +378,10 @@ struct ContentView: View {
     private enum ArrowDir { case up, down, left, right }
 
     private func handleArrow(_ dir: ArrowDir, phase: KeyPress.Phases) -> KeyPress.Result {
-        // Block all input while the fight-start transition is playing.
+        // Block all input while the fight-start transition is playing
+        // or the Game Over screen is up.
         if fightTransitionStart != nil { return .handled }
+        if gameOverStart != nil { return .handled }
         // While a battle event is running, arrows drive the menu
         // instead of the map. Left/right have no menu meaning yet, so
         // they no-op. During an active die-roll (awaitingRoll) or its
@@ -401,6 +421,7 @@ struct ContentView: View {
 
     private func handleInteract() -> KeyPress.Result {
         if fightTransitionStart != nil { return .handled }
+        if gameOverStart != nil { return .handled }
         if inBattle && resolvingRoll { return .handled }
         if inBattle && !awaitingRoll {
             confirmMenuSelection()
@@ -458,6 +479,13 @@ struct ContentView: View {
     /// phase can't leave the die stuck mid-shake.
     private func handleSpace(_ phase: KeyPress.Phases) -> KeyPress.Result {
         if fightTransitionStart != nil { return .handled }
+        if gameOverStart != nil {
+            // Only SPACE-down restarts; SPACE-up no-ops so the same
+            // tap that ended the run doesn't immediately reshake a
+            // die mid-restart.
+            if phase.contains(.down) { restartFromGameOver() }
+            return .handled
+        }
         let down = phase.contains(.down)
         let up = phase.contains(.up)
         if up { shakingDie = false }
@@ -512,6 +540,8 @@ struct ContentView: View {
         // epoch so FightView3D resets any exploded enemy state.
         defeatedEnemyAt = nil
         hitImpactStart = nil
+        enemyHitImpactStart = nil
+        enemyActedThisRound = false
         battleEpoch += 1
         camera.appendGameMessage("\(enemyName.uppercased()) bars your path. Battle!")
         // Kick off the pixel-shatter + ENGAGE intro and clear the
@@ -538,15 +568,37 @@ struct ContentView: View {
             camera.appendGameMessage("\(opt.name.uppercased()) is not yet available.")
             return
         }
+        let kind: PendingRoll
+        let prompt: String
         switch opt.name {
         case "Fight":
-            pendingRoll = .attack
-            camera.appendGameMessage("You ready a strike. Roll the die — hold SPACE, release to throw.")
+            kind = .attack
+            prompt = "You ready a strike. Roll the die — hold SPACE, release to throw."
         case "Flee":
-            pendingRoll = .flee
-            camera.appendGameMessage("You move to flee. Roll the die — hold SPACE, release to throw.")
+            kind = .flee
+            prompt = "You move to flee. Roll the die — hold SPACE, release to throw."
         default:
-            break
+            return
+        }
+        // Reset the round budget before deciding initiative. Tie goes
+        // to the player so a 1-SPD vs 1-SPD shade doesn't always
+        // preempt — defender's advantage.
+        enemyActedThisRound = false
+        if enemyStats.spd > playerStats.spd {
+            camera.appendGameMessage(
+                "\(enemyName.uppercased()) is faster — it strikes first! (SPD \(enemyStats.spd) vs \(playerStats.spd))"
+            )
+            // Gate input during the enemy preempt. Open the player's
+            // die window only after the laser resolves and the player
+            // is still standing.
+            resolvingRoll = true
+            runEnemyTurn {
+                pendingRoll = kind
+                camera.appendGameMessage(prompt)
+            }
+        } else {
+            pendingRoll = kind
+            camera.appendGameMessage(prompt)
         }
     }
 
@@ -608,15 +660,132 @@ struct ContentView: View {
         // `pendingRoll` set during the hold so the orb's die-kind
         // override doesn't flip back mid-display.
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.postRollHoldSeconds) {
-            resolvingRoll = false
             pendingRoll = nil
-            if endsBattle { endBattle() }
+            if endsBattle {
+                resolvingRoll = false
+                endBattle()
+            } else if enemyActedThisRound {
+                // The shade already preempted this round on initiative.
+                // Skip its second turn so speed shifts order, not count.
+                resolvingRoll = false
+            } else {
+                // Player's beat is over — shade gets its turn next.
+                // `resolvingRoll` stays true through the enemy turn so
+                // a stray key can't kick off a second shake mid-laser.
+                runEnemyTurn()
+            }
         }
     }
 
+    /// Length of the eye-glow telegraph before the laser snaps on.
+    /// Tuned with `Self.enemyBeamFade` so the full enemy turn is just
+    /// under a second.
+    private static let enemyWindupSeconds: Double = 0.55
+    /// Tail time after the beam fires — how long it lingers before
+    /// fading out and we hand control back to the player.
+    private static let enemyBeamFade: Double = 0.4
+
+    /// Shade's turn. Hidden d6 roll mirroring the player's crit table
+    /// so the rule reads symmetric even though the enemy's die isn't
+    /// tactile. The eye-laser visual is decorative — damage and the
+    /// red screen-flash both fire on the beam-land moment so they
+    /// sync to the cinematic. Pass `then` to chain a follow-up
+    /// (e.g. open the player's die window after a preempt strike).
+    private func runEnemyTurn(then: (() -> Void)? = nil) {
+        enemyActedThisRound = true
+        let roll = Int.random(in: 1...6)
+        let isCritMiss = (roll == 1)
+        let isCritHit = (roll == 6)
+        let base = enemyStats.str + roll - playerStats.physDef
+        let damage = isCritMiss ? 0 : max(1, base + (isCritHit ? 2 : 0))
+
+        // Kick the visual immediately. FightView3D drives windup +
+        // beam timing; the numbers below stay in sync with it.
+        enemyAttackAt = Date()
+
+        let windup = Self.enemyWindupSeconds
+        let beamFade = Self.enemyBeamFade
+
+        // Beam-impact moment: apply damage, red flash + shake, log.
+        DispatchQueue.main.asyncAfter(deadline: .now() + windup) {
+            if isCritMiss {
+                camera.appendGameMessage(
+                    "\(enemyName) fires — the beam whips past you. (rolls 1)"
+                )
+            } else {
+                playerStats.hp = max(0, playerStats.hp - damage)
+                let prefix = isCritHit ? "CRITICAL HIT! " : ""
+                let critTag = isCritHit ? " + 2 crit" : ""
+                camera.appendGameMessage(
+                    "\(prefix)\(enemyName)'s eye-beam burns you for \(damage). (STR \(enemyStats.str) + \(roll) − PDF \(playerStats.physDef)\(critTag))"
+                )
+                triggerEnemyHitImpact()
+            }
+        }
+
+        // Hand control back after the beam fades. KO triggers the
+        // Game Over outro (shatter + prompt); otherwise run the
+        // optional chain (used by the preempt path to open the
+        // player's die window).
+        DispatchQueue.main.asyncAfter(deadline: .now() + windup + beamFade) {
+            resolvingRoll = false
+            if playerStats.hp == 0 {
+                camera.appendGameMessage("You collapse before \(enemyName). Defeated.")
+                triggerGameOver()
+            } else {
+                then?()
+            }
+        }
+    }
+
+    /// Kick off the shatter outro. Leaves `inBattle` true so the
+    /// FightView3D backdrop stays visible behind the cells while they
+    /// pop in, but clears every other transient battle flag so a
+    /// half-finished animation can't tick over the top of the
+    /// outro.
+    private func triggerGameOver() {
+        gameOverStart = Date()
+        pendingRoll = nil
+        resolvingRoll = false
+        shakingDie = false
+        enemyActedThisRound = false
+    }
+
+    /// SPACE handler when the Game Over screen is up. Resets player
+    /// stats, jumps to floor 1 (restoring the cached version if the
+    /// player had explored it earlier so reveal state is preserved),
+    /// and clears the outro. The death-floor map is *not* saved into
+    /// the cache — the player's position there would be on the enemy
+    /// tile they died on, which would re-trigger the same fight if
+    /// they revisited.
+    private func restartFromGameOver() {
+        playerStats = Stats(
+            hp: 20, maxHP: 20, mp: 10, maxMP: 10,
+            str: 1, spd: 1, physDef: 1, mag: 1, magDef: 1
+        )
+        enemyStats = currentEnemyType.baselineStats(floor: 1)
+        inBattle = false
+        pendingRoll = nil
+        resolvingRoll = false
+        enemyActedThisRound = false
+        fightTransitionStart = nil
+        hitImpactStart = nil
+        enemyHitImpactStart = nil
+        defeatedEnemyAt = nil
+        enemyAttackAt = nil
+        shakingDie = false
+        if let saved = floorsByNumber[1] {
+            dungeonMap = saved
+        } else {
+            dungeonMap = DungeonMap.make(floor: 1)
+        }
+        gameOverStart = nil
+        camera.appendGameMessage("You wake. The dungeon resets to its first floor.")
+    }
+
     /// Kick off the white-flash + screen-shake feedback that plays
-    /// whenever damage actually lands. Auto-clears after 0.3s so the
-    /// driving TimelineView pauses again.
+    /// whenever the *player's* hit lands on the enemy. Auto-clears
+    /// after 0.3s so the driving TimelineView pauses again.
     private func triggerHitImpact() {
         let start = Date()
         hitImpactStart = start
@@ -625,29 +794,69 @@ struct ContentView: View {
         }
     }
 
-    /// Computes the current flash opacity and shake offset for the
+    /// Kick off the red full-screen wash + heavier shake the moment
+    /// the shade's laser visually lands on the camera. Distinct from
+    /// `triggerHitImpact` so the player→enemy and enemy→player
+    /// directions read at a glance.
+    private func triggerEnemyHitImpact() {
+        let start = Date()
+        enemyHitImpactStart = start
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.enemyImpactDuration + 0.05) {
+            if enemyHitImpactStart == start { enemyHitImpactStart = nil }
+        }
+    }
+
+    /// How long the red overlay lingers after the beam lands. Longer
+    /// than the player's white pop so it reads as taking a serious
+    /// hit, but short enough not to bleed into the next menu open.
+    private static let enemyImpactDuration: Double = 0.55
+
+    /// Computes the current flash opacities and shake offset for the
     /// fight ZStack. The TimelineView wrapping the ZStack feeds in
     /// the current frame's `Date` and pauses when no impact is
     /// pending so this isn't hot in the steady state.
-    private func impactValues(now: Date) -> (flash: Double, shake: CGSize) {
-        guard let start = hitImpactStart else { return (0, .zero) }
-        let elapsed = now.timeIntervalSince(start)
-        let flashDur: Double = 0.15
-        let shakeDur: Double = 0.22
-        let flash: Double = elapsed < flashDur
-            ? max(0, 1 - elapsed / flashDur) * 0.55  // peak ~55% white
-            : 0
-        let shake: CGSize
-        if elapsed < shakeDur {
-            let damping = 1.0 - (elapsed / shakeDur)
-            let intensity = 7.0 * damping
-            let angle = elapsed * 80
-            shake = CGSize(width: cos(angle) * intensity,
-                           height: sin(angle * 1.4) * intensity * 0.6)
-        } else {
-            shake = .zero
+    private func impactValues(now: Date) -> (whiteFlash: Double, redFlash: Double, shake: CGSize) {
+        var whiteFlash: Double = 0
+        var shake = CGSize.zero
+        if let start = hitImpactStart {
+            let elapsed = now.timeIntervalSince(start)
+            let flashDur: Double = 0.15
+            let shakeDur: Double = 0.22
+            whiteFlash = elapsed < flashDur
+                ? max(0, 1 - elapsed / flashDur) * 0.55
+                : 0
+            if elapsed < shakeDur {
+                let damping = 1.0 - (elapsed / shakeDur)
+                let intensity = 7.0 * damping
+                let angle = elapsed * 80
+                shake = CGSize(width: cos(angle) * intensity,
+                               height: sin(angle * 1.4) * intensity * 0.6)
+            }
         }
-        return (flash, shake)
+        // Enemy laser impact stacks its own (red) flash + heavier shake.
+        // Two impacts overlapping is unlikely in practice but the math
+        // adds them so a stray collision doesn't blank one out.
+        var redFlash: Double = 0
+        if let start = enemyHitImpactStart {
+            let elapsed = now.timeIntervalSince(start)
+            let dur = Self.enemyImpactDuration
+            let rampIn: Double = 0.05
+            // Quick ramp up, then linear fade out — feels like the
+            // beam slammed the camera then the world recovers.
+            let curve: Double = elapsed < rampIn
+                ? (elapsed / rampIn)
+                : max(0, 1 - (elapsed - rampIn) / (dur - rampIn))
+            redFlash = curve * 0.78
+            let shakeDur: Double = 0.42
+            if elapsed < shakeDur {
+                let damping = 1.0 - (elapsed / shakeDur)
+                let intensity = 14.0 * damping
+                let angle = elapsed * 90
+                shake.width  += cos(angle) * intensity
+                shake.height += sin(angle * 1.4) * intensity * 0.6
+            }
+        }
+        return (whiteFlash, redFlash, shake)
     }
 
     /// Convert the tile the player is standing on from `.enemy` to
@@ -688,13 +897,14 @@ struct ContentView: View {
     /// SwiftUI's generic inference when wrapped in TimelineView.
     @ViewBuilder
     private func fightLayerStack(at now: Date) -> some View {
-        let (flashAlpha, shake) = impactValues(now: now)
+        let (flashAlpha, redAlpha, shake) = impactValues(now: now)
         ZStack {
             DungeonView3D(map: dungeonMap)
                 .opacity(inBattle ? 0 : 1)
                 .allowsHitTesting(!inBattle)
             FightView3D(battleEpoch: battleEpoch,
-                         defeatedAt: defeatedEnemyAt)
+                         defeatedAt: defeatedEnemyAt,
+                         attackAt: enemyAttackAt)
                 .opacity(inBattle ? 1 : 0)
                 .allowsHitTesting(inBattle)
             BattleHUD(enemyName: enemyName,
@@ -712,11 +922,25 @@ struct ContentView: View {
                 BattleTransitionView(startedAt: started)
                     .allowsHitTesting(false)
             }
-            // Hit flash — drawn last so it sits over HUD too.
+            // Red wash — enemy laser landing on the camera. Drawn
+            // first so the white player-hit pop sits on top of it
+            // (the two rarely overlap, but if they do the white spike
+            // remains legible).
+            Rectangle()
+                .fill(Color(red: 1.0, green: 0.08, blue: 0.12))
+                .opacity(redAlpha)
+                .allowsHitTesting(false)
+            // White hit flash — drawn last so it sits over HUD too.
             Rectangle()
                 .fill(Color.white)
                 .opacity(flashAlpha)
                 .allowsHitTesting(false)
+            // Game Over outro — covers everything (scene + HUD +
+            // flashes). Stays up until the player presses SPACE.
+            if let started = gameOverStart {
+                GameOverView(startedAt: started)
+                    .allowsHitTesting(false)
+            }
         }
         .offset(shake)
     }
@@ -731,7 +955,8 @@ struct ContentView: View {
         // is instant.
         standardOverlays(
             TimelineView(.animation(minimumInterval: 1.0/60.0,
-                                     paused: hitImpactStart == nil)) { ctx in
+                                     paused: hitImpactStart == nil
+                                          && enemyHitImpactStart == nil)) { ctx in
                 fightLayerStack(at: ctx.date)
             },
             // Only show the die window when a roll is actually
@@ -1592,11 +1817,21 @@ struct FightView3D: NSViewRepresentable {
     /// Set when the player kills the enemy. The coordinator notices
     /// the new timestamp and runs the wireframe-explode animation.
     var defeatedAt: Date? = nil
+    /// Bumped each time the enemy starts a turn. The coordinator
+    /// runs an eye-glow windup followed by a laser beam toward the
+    /// camera. Damage / hit-impact are scheduled by the parent so
+    /// they land on the visual beam fire.
+    var attackAt: Date? = nil
 
     final class Coordinator {
         weak var enemyNode: SCNNode?
+        weak var leftEyeGlow: SCNNode?
+        weak var rightEyeGlow: SCNNode?
+        weak var leftBeam: SCNNode?
+        weak var rightBeam: SCNNode?
         var lastEpoch: Int = -1
         var lastDefeatTrigger: Date? = nil
+        var lastAttackTrigger: Date? = nil
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -1624,6 +1859,7 @@ struct FightView3D: NSViewRepresentable {
 
         addFloorGrid(to: scene)
         context.coordinator.enemyNode = addEnemy(to: scene)
+        addEyeWeapons(to: scene, coord: context.coordinator)
         addPlayerSilhouette(to: scene)
 
         view.scene = scene
@@ -1637,11 +1873,17 @@ struct FightView3D: NSViewRepresentable {
         if battleEpoch != coord.lastEpoch {
             coord.lastEpoch = battleEpoch
             resetEnemy(coord.enemyNode)
+            resetEyeWeapons(coord)
         }
         // Enemy defeated: animate the wireframe disintegration.
         if let trigger = defeatedAt, trigger != coord.lastDefeatTrigger {
             coord.lastDefeatTrigger = trigger
             explodeEnemy(coord.enemyNode)
+        }
+        // Enemy turn: windup + beam.
+        if let trigger = attackAt, trigger != coord.lastAttackTrigger {
+            coord.lastAttackTrigger = trigger
+            fireEyeLaser(coord)
         }
     }
 
@@ -1663,6 +1905,160 @@ struct FightView3D: NSViewRepresentable {
         node.removeAllActions()
         node.scale = SCNVector3(1, 1, 1)
         node.opacity = 1
+    }
+
+    /// Eye positions on the shade's head — kept in sync with the bars
+    /// drawn inside `addEnemy`. The beam target sits just in front of
+    /// the camera (camera is at z=3.5) so the two beams visibly fly
+    /// into the lens.
+    private static let leftEyePos  = SCNVector3(-0.10, 1.60, 0.20)
+    private static let rightEyePos = SCNVector3( 0.10, 1.60, 0.20)
+    private static let beamTarget  = SCNVector3( 0.00, 1.85, 3.40)
+    private static let laserColor  = NSColor(calibratedRed: 1.00,
+                                              green: 0.20,
+                                              blue:  0.28,
+                                              alpha: 1.00)
+
+    /// Build the windup-glow spheres and the laser beam lines. All
+    /// four nodes start invisible; `fireEyeLaser` animates them.
+    private func addEyeWeapons(to scene: SCNScene, coord: Coordinator) {
+        coord.leftEyeGlow  = makeEyeGlow(at: Self.leftEyePos)
+        coord.rightEyeGlow = makeEyeGlow(at: Self.rightEyePos)
+        if let l = coord.leftEyeGlow  { scene.rootNode.addChildNode(l) }
+        if let r = coord.rightEyeGlow { scene.rootNode.addChildNode(r) }
+
+        coord.leftBeam  = makeBeam(from: Self.leftEyePos,  to: Self.beamTarget)
+        coord.rightBeam = makeBeam(from: Self.rightEyePos, to: Self.beamTarget)
+        if let l = coord.leftBeam  { scene.rootNode.addChildNode(l) }
+        if let r = coord.rightBeam { scene.rootNode.addChildNode(r) }
+    }
+
+    private func makeEyeGlow(at p: SCNVector3) -> SCNNode {
+        let sphere = SCNSphere(radius: 0.07)
+        sphere.segmentCount = 12
+        let mat = SCNMaterial()
+        mat.diffuse.contents  = NSColor.black
+        mat.emission.contents = Self.laserColor
+        mat.lightingModel     = .constant
+        sphere.firstMaterial  = mat
+        let node = SCNNode(geometry: sphere)
+        node.position = p
+        node.opacity  = 0
+        node.scale    = SCNVector3(0.4, 0.4, 0.4)
+        return node
+    }
+
+    /// Thick laser beam built as an SCNCylinder. The cylinder lives
+    /// inside a parent node anchored at the eye and rotated so its
+    /// local +Y points at the target; the cylinder is offset along
+    /// that axis so the parent's origin sits at the eye end of the
+    /// beam. Animating `parent.scale` uniformly from 0 to 1 makes the
+    /// beam visually extend out of the eye toward the camera while
+    /// also "thickening" — gives the impression of a launched bolt.
+    private func makeBeam(from a: SCNVector3, to b: SCNVector3) -> SCNNode? {
+        let dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z
+        let length = sqrt(dx * dx + dy * dy + dz * dz)
+        guard length > 1e-4 else { return nil }
+        let cyl = SCNCylinder(radius: 0.055, height: CGFloat(length))
+        cyl.radialSegmentCount = 12
+        let mat = SCNMaterial()
+        mat.diffuse.contents  = NSColor.black
+        mat.emission.contents = Self.laserColor
+        mat.lightingModel     = .constant
+        cyl.firstMaterial     = mat
+        let geomNode = SCNNode(geometry: cyl)
+        // Shift the cylinder so its base sits at the parent origin —
+        // when the parent scales up, the beam grows outward from the
+        // eye, not from the midpoint.
+        geomNode.position = SCNVector3(0, length / 2, 0)
+
+        let parent = SCNNode()
+        parent.position = a
+        // Rotate parent so local +Y aligns with (b - a). Default
+        // cylinder axis is +Y, so this aims the beam at the target.
+        let dir = simd_normalize(SIMD3<Float>(Float(dx), Float(dy), Float(dz)))
+        let up  = SIMD3<Float>(0, 1, 0)
+        let axis = simd_cross(up, dir)
+        let dot  = simd_dot(up, dir)
+        let axisLen = simd_length(axis)
+        if axisLen > 1e-5 {
+            let angle = acos(max(-1, min(1, dot)))
+            let n = axis / axisLen
+            parent.rotation = SCNVector4(CGFloat(n.x), CGFloat(n.y),
+                                         CGFloat(n.z), CGFloat(angle))
+        } else if dot < 0 {
+            // dir == -Y: flip 180° around X.
+            parent.rotation = SCNVector4(1, 0, 0, CGFloat.pi)
+        }
+        parent.addChildNode(geomNode)
+        parent.opacity = 0
+        parent.scale   = SCNVector3(0, 0, 0)
+        return parent
+    }
+
+    /// Run the eye-glow windup followed by the laser shoot. Durations
+    /// match `BattleView.enemyWindupSeconds` / `enemyBeamFade` so the
+    /// damage + red flash schedule lines up with the visual beam.
+    private func fireEyeLaser(_ coord: Coordinator) {
+        let windup: Double = 0.55
+        let beamFade: Double = 0.40
+
+        // Glow: fade in + scale up during windup, hold while the beam
+        // fires, then fade out as the beam dies.
+        let glowIn = SCNAction.group([
+            SCNAction.fadeIn(duration: windup),
+            SCNAction.scale(to: 1.5, duration: windup)
+        ])
+        glowIn.timingMode = .easeIn
+        let glowHold = SCNAction.wait(duration: 0.12)
+        let glowOut  = SCNAction.group([
+            SCNAction.fadeOut(duration: beamFade),
+            SCNAction.scale(to: 0.4, duration: beamFade)
+        ])
+        glowOut.timingMode = .easeOut
+        let glowSeq = SCNAction.sequence([glowIn, glowHold, glowOut])
+
+        // Beam: invisible during windup, then SHOOT — uniform scale
+        // 0→1 over a fast 90 ms grows the cylinder from the eye out
+        // to the camera. Opacity flips on at the same instant so the
+        // cylinder doesn't briefly appear at zero scale.
+        let beamWait  = SCNAction.wait(duration: windup)
+        let beamReset = SCNAction.run { node in
+            node.opacity = 1
+            node.scale   = SCNVector3(0, 0, 0)
+        }
+        let beamShoot = SCNAction.scale(to: 1.0, duration: 0.09)
+        beamShoot.timingMode = .easeOut
+        let beamHold = SCNAction.wait(duration: 0.10)
+        let beamOff  = SCNAction.fadeOut(duration: beamFade - 0.19)
+        let beamSeq  = SCNAction.sequence([beamWait, beamReset, beamShoot, beamHold, beamOff])
+
+        // Restart on retrigger — `removeAllActions` so a quick second
+        // turn doesn't compound onto a still-running animation.
+        for n in [coord.leftEyeGlow, coord.rightEyeGlow] {
+            n?.removeAllActions()
+            n?.runAction(glowSeq)
+        }
+        for n in [coord.leftBeam, coord.rightBeam] {
+            n?.removeAllActions()
+            n?.runAction(beamSeq)
+        }
+    }
+
+    /// Snap glow + beam state back to the hidden defaults. Called on
+    /// a new battle so a partially-played laser from the previous
+    /// encounter doesn't bleed into the next one.
+    private func resetEyeWeapons(_ coord: Coordinator) {
+        for n in [coord.leftEyeGlow, coord.rightEyeGlow] {
+            n?.removeAllActions()
+            n?.opacity = 0
+            n?.scale   = SCNVector3(0.4, 0.4, 0.4)
+        }
+        for n in [coord.leftBeam, coord.rightBeam] {
+            n?.removeAllActions()
+            n?.opacity = 0
+            n?.scale   = SCNVector3(0, 0, 0)
+        }
     }
 
     /// Receding floor grid for spatial context. Tron green, matching
@@ -2003,6 +2399,96 @@ struct BattleTransitionView: View {
             return max(0, 1 - (elapsed - fadeOutStart) / 0.18)
         }
         return 0
+    }
+}
+
+/// Death sting: the screen shatters into red-skewed cells and stays
+/// there as a backdrop for the GAME OVER readout. Mirrors
+/// `BattleTransitionView` but skips the dissolve phase — the cells
+/// hold until the player presses SPACE and the parent clears
+/// `gameOverStart`.
+struct GameOverView: View {
+    let startedAt: Date
+
+    /// How long the cells take to fully pop in. Slightly slower than
+    /// the ENGAGE shatter so the death beat feels heavier.
+    static let shatterDuration: Double = 0.45
+    /// Delay after the cells finish before the text fades in.
+    static let textHoldDelay: Double = 0.10
+    static let textFadeIn: Double = 0.40
+
+    private static let cols = 32
+    private static let rows = 18
+    private static let cellCount = cols * rows
+
+    /// Red-and-black heavy palette so the field reads as somber/death
+    /// rather than the festival-colored ENGAGE intro.
+    private static let palette: [Color] = [
+        Color(red: 0.95, green: 0.25, blue: 0.30),
+        Color(red: 1.00, green: 0.15, blue: 0.20),
+        Color(red: 0.55, green: 0.10, blue: 0.15),
+        Color(red: 0.30, green: 0.05, blue: 0.10),
+        Color(white: 0.04),
+        Color(white: 0.04),
+        Color(white: 0.04),
+    ]
+
+    @State private var cellDelays: [Double] = (0..<GameOverView.cellCount)
+        .map { _ in Double.random(in: 0...0.85) }
+    @State private var cellColors: [Color] = (0..<GameOverView.cellCount)
+        .map { _ in GameOverView.palette.randomElement() ?? .black }
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let elapsed = context.date.timeIntervalSince(startedAt)
+            ZStack {
+                Canvas { ctx, size in
+                    let cellW = size.width / Double(Self.cols)
+                    let cellH = size.height / Double(Self.rows)
+                    for i in 0..<Self.cellCount {
+                        let opacity = cellOpacity(elapsed: elapsed,
+                                                   delay: cellDelays[i])
+                        guard opacity > 0.01 else { continue }
+                        let r = i / Self.cols
+                        let c = i % Self.cols
+                        let rect = CGRect(x: Double(c) * cellW,
+                                          y: Double(r) * cellH,
+                                          width: cellW, height: cellH)
+                        ctx.fill(Path(rect),
+                                 with: .color(cellColors[i].opacity(opacity)))
+                    }
+                }
+                VStack(spacing: 32) {
+                    Text("GAME OVER")
+                        .font(.system(size: 104, weight: .black, design: .monospaced))
+                        .kerning(10)
+                        .foregroundColor(Color(red: 1.00, green: 0.95, blue: 0.95))
+                        .shadow(color: Color(red: 1.00, green: 0.20, blue: 0.20).opacity(0.9),
+                                radius: 24)
+                    Text("PRESS  SPACE  TO  TRY  AGAIN")
+                        .font(.system(size: 22, weight: .bold, design: .monospaced))
+                        .kerning(4)
+                        .foregroundColor(Color(red: 1.00, green: 0.85, blue: 0.80))
+                }
+                .opacity(textOpacity(elapsed: elapsed))
+            }
+        }
+    }
+
+    private func cellOpacity(elapsed: Double, delay: Double) -> Double {
+        if elapsed < 0 { return 0 }
+        let cellStart = delay * Self.shatterDuration * 0.55
+        let cellElapsed = elapsed - cellStart
+        if cellElapsed <= 0 { return 0 }
+        let fadeIn = Self.shatterDuration * 0.45
+        return min(1, cellElapsed / fadeIn)
+    }
+
+    private func textOpacity(elapsed: Double) -> Double {
+        let textStart = Self.shatterDuration + Self.textHoldDelay
+        if elapsed < textStart { return 0 }
+        let progress = (elapsed - textStart) / Self.textFadeIn
+        return min(1, max(0, progress))
     }
 }
 
