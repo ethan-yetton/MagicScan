@@ -443,7 +443,14 @@ struct ContentView: View {
         guard !inBattle else { return false }
         let r = dungeonMap.playerRow, c = dungeonMap.playerCol
         switch dungeonMap.tiles[r][c].kind {
-        case .door:
+        case .door, .lockedDoor:
+            if dungeonMap.tiles[r][c].kind == .lockedDoor {
+                guard dungeonMap.hasKey else {
+                    camera.appendGameMessage("The stairwell is sealed. Find this floor's key first.")
+                    return true
+                }
+                camera.appendGameMessage("Your key fits. The stairwell grinds open.")
+            }
             let next = dungeonMap.floor + 1
             guard next <= Self.maxFloor else {
                 camera.appendGameMessage("The door refuses to open. The dungeon ends here.")
@@ -879,6 +886,12 @@ struct ContentView: View {
         case .enemy:    camera.appendGameMessage("You spot an enemy.")
         case .door:     camera.appendGameMessage("You find a door leading down. Press space to descend.")
         case .stairsUp: camera.appendGameMessage("Stairs lead back up. Press space to ascend.")
+        case .keyChest:
+            camera.appendGameMessage("You pry open a chest — a heavy KEY rests inside. The sealed stairwell will open now.")
+        case .lockedDoor:
+            camera.appendGameMessage(dungeonMap.hasKey
+                ? "A sealed stairwell. Your key fits — press space to descend."
+                : "A sealed stairwell. You need this floor's key to open it.")
         }
     }
 
@@ -1057,6 +1070,12 @@ struct ContentView: View {
 
 enum DungeonTileKind {
     case empty, wall, chest, enemy, door, stairsUp
+    /// A chest that also holds the floor's key. Visually distinct so a
+    /// revealed key chest reads as the objective at a glance.
+    case keyChest
+    /// A descent door sealed until the player carries this floor's key.
+    /// Floors below `DungeonMap.keyFloorStart` never produce these.
+    case lockedDoor
 }
 
 struct DungeonTile {
@@ -1067,9 +1086,16 @@ struct DungeonTile {
 struct DungeonMap {
     static let columns = 16
     static let rows = 12
+    /// First floor where the stairwell is sealed and a key must be
+    /// found to descend. Floors below this are the plain ruleset.
+    static let keyFloorStart = 6
 
     var tiles: [[DungeonTile]]
     var floor: Int
+    /// True once the player has stepped onto this floor's key chest.
+    /// Lives on the map so it persists with the cached floor across
+    /// ascend/descend. Floors without a key never set it.
+    var hasKey: Bool = false
     /// Current player tile (row, col). Reachability is measured from
     /// here, and the 3D camera is parked over this tile.
     var playerRow: Int
@@ -1139,6 +1165,29 @@ struct DungeonMap {
             }
         }
 
+        // From `keyFloorStart` the stairwell is sealed: every door on
+        // the floor becomes a `.lockedDoor`, and one reachable chest
+        // (or, failing that, a reachable empty tile) becomes the
+        // `.keyChest`. Only commit the lock if a reachable key spot
+        // exists — otherwise a degenerate boxed-in floor would be an
+        // unescapable softlock, so it stays the plain ruleset.
+        if floor >= Self.keyFloorStart {
+            let notSpawn: ((Int, Int)) -> Bool = { !($0.0 == sr && $0.1 == sc) }
+            let keySpot =
+                reachableCoords.filter { notSpawn($0) && grid[$0.0][$0.1].kind == .chest }
+                    .randomElement()
+                ?? reachableCoords.filter { notSpawn($0) && grid[$0.0][$0.1].kind == .empty }
+                    .randomElement()
+            if let keySpot {
+                for r in 0..<rows {
+                    for c in 0..<columns where grid[r][c].kind == .door {
+                        grid[r][c].kind = .lockedDoor
+                    }
+                }
+                grid[keySpot.0][keySpot.1].kind = .keyChest
+            }
+        }
+
         var map = DungeonMap(tiles: grid, floor: floor,
                              playerRow: sr, playerCol: sc,
                              playerFacing: 0)
@@ -1194,8 +1243,16 @@ struct DungeonMap {
         tiles[row][col].revealed = true
         playerRow = row
         playerCol = col
+        grabKeyIfPresent(row, col)
         revealAdjacentWalls(row: row, col: col)
         return wasRevealed ? nil : tiles[row][col].kind
+    }
+
+    /// Picking up the floor's key is just stepping onto its chest. The
+    /// chest tile stays a `.keyChest` (its discovery message fires once
+    /// via `step`'s revealed-gate); `hasKey` is what gates the door.
+    private mutating func grabKeyIfPresent(_ r: Int, _ c: Int) {
+        if tiles[r][c].kind == .keyChest { hasKey = true }
     }
 
     /// Rotate the player in place. `delta = +1` turns right (clockwise
@@ -1231,6 +1288,7 @@ struct DungeonMap {
         tiles[r][c].revealed = true
         playerRow = r
         playerCol = c
+        grabKeyIfPresent(r, c)
         revealAdjacentWalls(row: r, col: c)
         return wasRevealed ? nil : tiles[r][c].kind
     }
@@ -1328,7 +1386,7 @@ struct DungeonMapView: View {
         // rather than mutating the map locally.
         if isPlayer {
             let kind = map.tiles[row][col].kind
-            if kind == .door || kind == .stairsUp { onStairs() }
+            if kind == .door || kind == .lockedDoor || kind == .stairsUp { onStairs() }
             return
         }
         guard map.canMoveTo(row: row, col: col) else { return }
@@ -1343,6 +1401,12 @@ struct DungeonMapView: View {
         case .enemy:    log("You spot an enemy.")
         case .door:     log("You find a door leading down. Click again to descend.")
         case .stairsUp: log("Stairs lead back up. Click again to ascend.")
+        case .keyChest:
+            log("You pry open a chest — a heavy KEY rests inside. The sealed stairwell will open now.")
+        case .lockedDoor:
+            log(map.hasKey
+                ? "A sealed stairwell. Your key fits — click again to descend."
+                : "A sealed stairwell. You need this floor's key to open it.")
         }
     }
 
@@ -1418,6 +1482,8 @@ struct DungeonMapView: View {
         case .enemy:    return "E"
         case .door:     return "⌂"
         case .stairsUp: return "↑"
+        case .keyChest: return "⚷"
+        case .lockedDoor: return "⌂"
         }
     }
 
@@ -1429,6 +1495,8 @@ struct DungeonMapView: View {
         case .enemy:    return Color(red: 0.92, green: 0.32, blue: 0.32)
         case .door:     return Color(red: 0.40, green: 0.78, blue: 0.95)
         case .stairsUp: return Color(red: 1.00, green: 0.55, blue: 0.75)
+        case .keyChest: return Color(red: 1.00, green: 0.84, blue: 0.30)
+        case .lockedDoor: return Color(red: 0.95, green: 0.45, blue: 0.45)
         }
     }
 }
@@ -1566,6 +1634,8 @@ struct DungeonView3D: NSViewRepresentable {
         var chestSegs:    [(SIMD3<Float>, SIMD3<Float>)] = []
         var enemySegs:    [(SIMD3<Float>, SIMD3<Float>)] = []
         var doorSegs:     [(SIMD3<Float>, SIMD3<Float>)] = []
+        var lockedDoorSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        var keyChestSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
         var stairsUpSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
 
         for r in 0..<rows {
@@ -1628,6 +1698,12 @@ struct DungeonView3D: NSViewRepresentable {
                                      baseSize: 0.52, height: 0.7)
                 case .door:
                     addDoorEdges(to: &doorSegs, base: p)
+                case .lockedDoor:
+                    addDoorEdges(to: &lockedDoorSegs, base: p)
+                case .keyChest:
+                    addBoxEdges(to: &keyChestSegs,
+                                 center: SIMD3<Float>(p.x, 0.18, p.z),
+                                 size: SIMD3<Float>(0.52, 0.36, 0.4))
                 case .stairsUp:
                     addDoorEdges(to: &stairsUpSegs, base: p)
                 }
@@ -1640,6 +1716,8 @@ struct DungeonView3D: NSViewRepresentable {
         let chestColor    = NSColor(calibratedRed: 0.65, green: 1.00, blue: 0.30, alpha: 1)
         let enemyColor    = NSColor(calibratedRed: 0.00, green: 0.95, blue: 1.00, alpha: 1)
         let doorColor     = NSColor(calibratedRed: 0.45, green: 0.80, blue: 1.00, alpha: 1)
+        let lockedDoorColor = NSColor(calibratedRed: 1.00, green: 0.40, blue: 0.40, alpha: 1)
+        let keyChestColor = NSColor(calibratedRed: 1.00, green: 0.84, blue: 0.30, alpha: 1)
         let stairsUpColor = NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.80, alpha: 1)
 
         for (segs, color) in [
@@ -1649,6 +1727,8 @@ struct DungeonView3D: NSViewRepresentable {
             (chestSegs,    chestColor),
             (enemySegs,    enemyColor),
             (doorSegs,     doorColor),
+            (lockedDoorSegs, lockedDoorColor),
+            (keyChestSegs, keyChestColor),
             (stairsUpSegs, stairsUpColor),
         ] {
             guard let geom = buildLineGeometry(segments: segs, color: color) else { continue }
