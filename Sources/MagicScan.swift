@@ -202,6 +202,10 @@ struct ContentView: View {
     /// past this floor get refused. Sized to leave plenty of headroom
     /// under the memory ceiling (~150 MB if every floor were cached).
     private static let maxFloor = 100_000
+    /// DEMO: descending through floor 5's door ends the run with the
+    /// win screen instead of generating floor 6. Temporary — remove
+    /// when the full progression is wired.
+    private static let demoFinalFloor = 5
     @State private var dungeonMap = DungeonMap.make(floor: 1)
     /// Combat state. Stats follow the locked 1-20 range; the damage
     /// formula `max(1, attacker.str + d20 - defender.physDef)` drives
@@ -266,6 +270,85 @@ struct ContentView: View {
     /// shatter outro; nil = normal play. SPACE while non-nil runs
     /// `restartFromGameOver`. All other input is blocked.
     @State private var gameOverStart: Date? = nil
+    /// DEMO: set when the player clears floor 5's door. Drives the
+    /// win-screen outro; nil = normal play. SPACE while non-nil runs
+    /// `restartFromWin`. Gated like `gameOverStart`.
+    @State private var winStart: Date? = nil
+    /// Unequipped gear carried this run. Capped at `backpackCap` so
+    /// "what do I drop?" stays a live decision. Wiped on any restart
+    /// (heirloom carry-over is a deferred follow-up).
+    @State private var backpack: [GearItem] = []
+    /// The three equip slots. Stat bumps from equipped items fold into
+    /// `effectivePlayerStats`; specials are read directly in combat.
+    @State private var equipped: [GearSlot: GearItem] = [:]
+    private static let backpackCap = 6
+    /// Inventory/equip overlay (dungeon, out of combat). `invIndex`
+    /// walks a flat list: the 3 slot rows, then each backpack item.
+    @State private var inventoryOpen = false
+    @State private var invIndex = 0
+
+    /// Flat selectable rows for the inventory cursor: the three slots
+    /// in fixed order, then the backpack items.
+    private var invSlotOrder: [GearSlot] { [.weapon, .armor, .trinket] }
+    private var invRowCount: Int { invSlotOrder.count + backpack.count }
+
+    private func invMove(_ delta: Int) {
+        guard invRowCount > 0 else { invIndex = 0; return }
+        invIndex = (invIndex + delta % invRowCount + invRowCount) % invRowCount
+    }
+
+    /// Return on a slot row unequips it; on a backpack row equips it.
+    private func invActivate() {
+        let slots = invSlotOrder
+        if invIndex < slots.count {
+            unequip(slots[invIndex])
+        } else {
+            let i = invIndex - slots.count
+            if backpack.indices.contains(i) { equip(backpack[i]) }
+        }
+        invIndex = min(invIndex, max(0, invRowCount - 1))
+    }
+
+    private func invDiscard() {
+        let i = invIndex - invSlotOrder.count
+        guard backpack.indices.contains(i) else { return }
+        discard(backpack[i])
+        invIndex = min(invIndex, max(0, invRowCount - 1))
+    }
+
+    private func toggleInventory() {
+        guard !inBattle, gameOverStart == nil, winStart == nil,
+              fightTransitionStart == nil else { return }
+        inventoryOpen.toggle()
+        invIndex = 0
+        keyboardFocused = true
+    }
+
+    /// Base stats + every equipped item's bumps, clamped to the locked
+    /// 1-20 design range (HP/MP caps may exceed 20 — they're pools,
+    /// not the d-roll-dominated combat stats). Combat reads THIS, not
+    /// `playerStats`; `playerStats.hp/.mp` stay the live current pools
+    /// and are mutated directly by damage.
+    private var effectivePlayerStats: Stats {
+        var s = playerStats
+        for it in equipped.values {
+            s.str += it.dStr; s.spd += it.dSpd
+            s.physDef += it.dPhysDef; s.mag += it.dMag; s.magDef += it.dMagDef
+            s.maxHP += it.dMaxHP; s.maxMP += it.dMaxMP
+        }
+        func clamp(_ v: Int) -> Int { max(1, min(20, v)) }
+        s.str = clamp(s.str); s.spd = clamp(s.spd)
+        s.physDef = clamp(s.physDef); s.mag = clamp(s.mag); s.magDef = clamp(s.magDef)
+        s.maxHP = max(1, s.maxHP); s.maxMP = max(0, s.maxMP)
+        s.hp = min(s.hp, s.maxHP); s.mp = min(s.mp, s.maxMP)
+        return s
+    }
+
+    /// Special on the equipped trinket/weapon/armor, if any. Combat
+    /// queries these by case.
+    private func hasSpecial(_ sp: GearSpecial) -> Bool {
+        equipped.values.contains { $0.special == sp }
+    }
     /// Increments each time a new battle starts. FightView3D uses
     /// this as a reset signal so a previous battle's exploded enemy
     /// snaps back to full scale/opacity before the next battle's
@@ -316,16 +399,50 @@ struct ContentView: View {
                     dungeonView3D()
                     DungeonMapView(map: $dungeonMap,
                                    onStairs: { useStairs() },
-                                   disabled: inBattle) {
-                        camera.appendGameMessage($0)
-                    }
+                                   disabled: inBattle,
+                                   log: { camera.appendGameMessage($0) },
+                                   onChest: { openChestHere() })
                 }
                 GameTextBox(messages: camera.gameMessages)
             } else {
                 cameraPreview()
             }
         }
-        .focusable(arrowMode || inBattle)
+        .overlay {
+            // Game Over outro — full-window so it covers the 3D pane,
+            // the 2D map, and the text log (paired with the win
+            // screen). Non-interactive: SPACE restart is handled by
+            // the existing key path, gated on `gameOverStart`.
+            if let started = gameOverStart {
+                GameOverView(startedAt: started)
+                    .allowsHitTesting(false)
+            }
+        }
+        .overlay {
+            // DEMO win screen — full-window, same treatment as Game
+            // Over. Non-interactive: SPACE is handled by the existing
+            // key path, gated on `winStart`.
+            if let started = winStart {
+                WinView(startedAt: started,
+                        items: backpack + Array(equipped.values))
+                    .allowsHitTesting(false)
+            }
+        }
+        .overlay {
+            // Inventory / equip menu — dungeon, out of combat.
+            // Keyboard-driven (gated via `inventoryOpen`); the dimmer
+            // takes hits so the map behind doesn't react to clicks.
+            if inventoryOpen {
+                InventoryView(slotOrder: invSlotOrder,
+                              equipped: equipped,
+                              backpack: backpack,
+                              selection: invIndex,
+                              base: playerStats,
+                              effective: effectivePlayerStats,
+                              cap: Self.backpackCap)
+            }
+        }
+        .focusable(arrowMode || inBattle || inventoryOpen)
         .focusEffectDisabled()
         .focused($keyboardFocused)
         .onKeyPress(.upArrow,    phases: [.down, .repeat]) { handleArrow(.up,    phase: $0.phase) }
@@ -334,6 +451,11 @@ struct ContentView: View {
         .onKeyPress(.rightArrow, phases: [.down, .repeat]) { handleArrow(.right, phase: $0.phase) }
         .onKeyPress(.space, phases: [.down, .up]) { handleSpace($0.phase) }
         .onKeyPress(.return)     { handleInteract() }
+        .onKeyPress(KeyEquivalent("i")) { toggleInventory(); return .handled }
+        .onKeyPress(KeyEquivalent("x")) {
+            if inventoryOpen { invDiscard(); return .handled }
+            return .ignored
+        }
         .onChange(of: playerPositionKey) { _ in
             // Drop shake state if we leave the tile mid-press.
             if !isOnEnemyTile { shakingDie = false }
@@ -382,6 +504,18 @@ struct ContentView: View {
         // or the Game Over screen is up.
         if fightTransitionStart != nil { return .handled }
         if gameOverStart != nil { return .handled }
+        if winStart != nil { return .handled }
+        // Inventory open: up/down move the cursor, nothing reaches the
+        // map. Discrete .down only so a held key doesn't race.
+        if inventoryOpen {
+            guard phase.contains(.down) else { return .handled }
+            switch dir {
+            case .up:    invMove(-1)
+            case .down:  invMove(1)
+            case .left, .right: break
+            }
+            return .handled
+        }
         // While a battle event is running, arrows drive the menu
         // instead of the map. Left/right have no menu meaning yet, so
         // they no-op. During an active die-roll (awaitingRoll) or its
@@ -422,12 +556,21 @@ struct ContentView: View {
     private func handleInteract() -> KeyPress.Result {
         if fightTransitionStart != nil { return .handled }
         if gameOverStart != nil { return .handled }
+        if winStart != nil { return .handled }
+        if inventoryOpen { invActivate(); return .handled }
         if inBattle && resolvingRoll { return .handled }
         if inBattle && !awaitingRoll {
             confirmMenuSelection()
             return .handled
         }
         guard arrowMode else { return .ignored }
+        // Standing on an un-opened chest: interact opens it (opt-in).
+        // Otherwise fall through to stair use.
+        let r = dungeonMap.playerRow, c = dungeonMap.playerCol
+        if dungeonMap.tiles[r][c].kind == .chest {
+            openChestHere()
+            return .handled
+        }
         return useStairs() ? .handled : .ignored
     }
 
@@ -450,6 +593,12 @@ struct ContentView: View {
                     return true
                 }
                 camera.appendGameMessage(Lexicon.keyFits())
+            }
+            // DEMO: clearing the final floor's door ends the run with
+            // the win screen rather than descending further.
+            if dungeonMap.floor >= Self.demoFinalFloor {
+                triggerWin()
+                return true
             }
             let next = dungeonMap.floor + 1
             guard next <= Self.maxFloor else {
@@ -493,6 +642,13 @@ struct ContentView: View {
             if phase.contains(.down) { restartFromGameOver() }
             return .handled
         }
+        if winStart != nil {
+            if phase.contains(.down) { restartFromWin() }
+            return .handled
+        }
+        // Inventory swallows SPACE so it can't shake a die behind the
+        // overlay.
+        if inventoryOpen { return .handled }
         let down = phase.contains(.down)
         let up = phase.contains(.up)
         if up { shakingDie = false }
@@ -590,9 +746,10 @@ struct ContentView: View {
         // to the player so a 1-SPD vs 1-SPD shade doesn't always
         // preempt — defender's advantage.
         enemyActedThisRound = false
-        if enemyStats.spd > playerStats.spd {
+        let eff = effectivePlayerStats
+        if enemyStats.spd > eff.spd {
             camera.appendGameMessage(
-                Lexicon.foeFaster(enemyName, foeSpd: enemyStats.spd, playerSpd: playerStats.spd)
+                Lexicon.foeFaster(enemyName, foeSpd: enemyStats.spd, playerSpd: eff.spd)
             )
             // Gate input during the enemy preempt. Open the player's
             // die window only after the laser resolves and the player
@@ -625,16 +782,27 @@ struct ContentView: View {
             if roll == 1 {
                 camera.appendGameMessage(Lexicon.critMissStrike())
             } else {
-                let isCrit = (roll == 6)
-                let base = playerStats.str + roll - enemyStats.physDef
+                let eff = effectivePlayerStats
+                // Keen Edge widens the crit window to 5-6.
+                let isCrit = roll == 6 || (roll == 5 && hasSpecial(.keenEdge))
+                let base = eff.str + roll - enemyStats.physDef
                 let damage = max(1, base + (isCrit ? 2 : 0))
                 enemyStats.hp = max(0, enemyStats.hp - damage)
                 camera.appendGameMessage(
                     Lexicon.strikeHit(roll: roll, foe: enemyName, damage: damage,
-                                      str: playerStats.str, pdf: enemyStats.physDef,
+                                      str: eff.str, pdf: enemyStats.physDef,
                                       crit: isCrit)
                 )
                 triggerHitImpact()
+                // Lifesteal: a connecting strike returns 2 HP, capped
+                // at the gear-adjusted max.
+                if hasSpecial(.lifesteal) && enemyStats.hp >= 0 {
+                    let healed = min(2, eff.maxHP - playerStats.hp)
+                    if healed > 0 {
+                        playerStats.hp += healed
+                        camera.appendGameMessage(Lexicon.lifestealTick(healed))
+                    }
+                }
                 if enemyStats.hp == 0 {
                     camera.appendGameMessage(Lexicon.foeCollapses(enemyName))
                     clearDefeatedEnemyTile()
@@ -643,6 +811,11 @@ struct ContentView: View {
                 }
             }
         case .flee:
+            if hasSpecial(.guaranteedFlee) {
+                camera.appendGameMessage(Lexicon.fleeGuaranteed(enemyName))
+                endsBattle = true
+                break
+            }
             switch roll {
             case 1:
                 playerStats.hp = max(0, playerStats.hp - 3)
@@ -702,7 +875,8 @@ struct ContentView: View {
         let roll = Int.random(in: 1...6)
         let isCritMiss = (roll == 1)
         let isCritHit = (roll == 6)
-        let base = enemyStats.str + roll - playerStats.physDef
+        let effPdf = effectivePlayerStats.physDef
+        let base = enemyStats.str + roll - effPdf
         let damage = isCritMiss ? 0 : max(1, base + (isCritHit ? 2 : 0))
 
         // Kick the visual immediately. FightView3D drives windup +
@@ -720,7 +894,7 @@ struct ContentView: View {
                 playerStats.hp = max(0, playerStats.hp - damage)
                 camera.appendGameMessage(
                     Lexicon.foeHit(enemyName, damage: damage, str: enemyStats.str,
-                                   roll: roll, pdf: playerStats.physDef,
+                                   roll: roll, pdf: effPdf,
                                    crit: isCritHit)
                 )
                 triggerEnemyHitImpact()
@@ -784,7 +958,116 @@ struct ContentView: View {
             dungeonMap = DungeonMap.make(floor: 1)
         }
         gameOverStart = nil
+        backpack = []
+        equipped = [:]
         camera.appendGameMessage(Lexicon.wake())
+    }
+
+    /// DEMO: kick off the win-screen outro when floor 5's door is
+    /// cleared. Mirrors `triggerGameOver` — clears transient flags so
+    /// nothing animates over the outro — but is reached from dungeon
+    /// navigation, not combat, so there's no battle state to unwind.
+    private func triggerWin() {
+        winStart = Date()
+        pendingRoll = nil
+        resolvingRoll = false
+        shakingDie = false
+        inBattle = false
+    }
+
+    /// SPACE handler when the win screen is up. Same fresh-run reset
+    /// as `restartFromGameOver` (floor 1, base stats, loot wiped),
+    /// just clearing `winStart` instead of `gameOverStart`.
+    private func restartFromWin() {
+        playerStats = Stats(
+            hp: 20, maxHP: 20, mp: 10, maxMP: 10,
+            str: 1, spd: 1, physDef: 1, mag: 1, magDef: 1
+        )
+        enemyStats = currentEnemyType.baselineStats(floor: 1)
+        inBattle = false
+        pendingRoll = nil
+        resolvingRoll = false
+        enemyActedThisRound = false
+        fightTransitionStart = nil
+        hitImpactStart = nil
+        enemyHitImpactStart = nil
+        defeatedEnemyAt = nil
+        enemyAttackAt = nil
+        shakingDie = false
+        floorsByNumber.removeAll()
+        dungeonMap = DungeonMap.make(floor: 1)
+        winStart = nil
+        backpack = []
+        equipped = [:]
+        camera.appendGameMessage(Lexicon.wake())
+    }
+
+    // MARK: Gear acquisition / management
+
+    /// Opt-in: open the chest the player is standing on. Never auto-
+    /// fires — a player who wants the bodysuit-only run just never
+    /// presses interact on chests. Rolls a depth-scaled item into the
+    /// backpack and spends the chest tile so it can't be re-opened. A
+    /// full backpack refuses (forcing a manage-gear decision first),
+    /// and the chest stays openable for when space is freed.
+    private func openChestHere() {
+        let r = dungeonMap.playerRow, c = dungeonMap.playerCol
+        guard dungeonMap.tiles[r][c].kind == .chest else { return }
+        guard backpack.count < Self.backpackCap else {
+            camera.appendGameMessage(Lexicon.backpackFull(Self.backpackCap))
+            return
+        }
+        let item = GearItem.roll(floor: dungeonMap.floor)
+        backpack.append(item)
+        dungeonMap.tiles[r][c].kind = .openedChest
+        camera.appendGameMessage(Lexicon.chestOpened(item.name, summary: item.summary))
+    }
+
+    /// Equip a backpack item into its slot. Whatever was in that slot
+    /// returns to the backpack. Pools reconcile via the before/after
+    /// effective-max diff so a slot swap can't double-count.
+    private func equip(_ item: GearItem) {
+        guard let idx = backpack.firstIndex(where: { $0.id == item.id }) else { return }
+        reconcilePools {
+            backpack.remove(at: idx)
+            if let prev = equipped[item.slot] { backpack.append(prev) }
+            equipped[item.slot] = item
+        }
+        camera.appendGameMessage(Lexicon.equipped(item.name, slot: item.slot.label))
+    }
+
+    /// Move an equipped item back to the backpack (if there's room).
+    private func unequip(_ slot: GearSlot) {
+        guard let item = equipped[slot] else { return }
+        guard backpack.count < Self.backpackCap else {
+            camera.appendGameMessage(Lexicon.backpackFull(Self.backpackCap))
+            return
+        }
+        reconcilePools {
+            equipped[slot] = nil
+            backpack.append(item)
+        }
+        camera.appendGameMessage(Lexicon.unequipped(item.name))
+    }
+
+    private func discard(_ item: GearItem) {
+        guard let idx = backpack.firstIndex(where: { $0.id == item.id }) else { return }
+        backpack.remove(at: idx)
+        camera.appendGameMessage(Lexicon.discarded(item.name))
+    }
+
+    /// Run an equip mutation, then keep current HP/MP coherent with
+    /// the new effective maxima: a net gain is granted live (the
+    /// buffer is felt immediately); a net loss clamps current down,
+    /// never below 1 HP so removing armor can't be lethal.
+    private func reconcilePools(_ mutate: () -> Void) {
+        let before = effectivePlayerStats
+        mutate()
+        let after = effectivePlayerStats
+        if after.maxHP > before.maxHP { playerStats.hp += after.maxHP - before.maxHP }
+        if after.maxMP > before.maxMP { playerStats.mp += after.maxMP - before.maxMP }
+        playerStats.hp = max(1, min(playerStats.hp, after.maxHP))
+        playerStats.mp = max(0, min(playerStats.mp, after.maxMP))
     }
 
     /// Kick off the white-flash + screen-shake feedback that plays
@@ -879,7 +1162,8 @@ struct ContentView: View {
         switch kind {
         case .empty:    camera.appendGameMessage(Lexicon.stepEmpty())
         case .wall:     break  // unreachable — step() rejects wall tiles
-        case .chest:    camera.appendGameMessage(Lexicon.stepChest())
+        case .chest:    camera.appendGameMessage(Lexicon.chestHere("Press space"))
+        case .openedChest: camera.appendGameMessage(Lexicon.chestSpent())
         case .enemy:    camera.appendGameMessage(Lexicon.stepFoe())
         case .door:     camera.appendGameMessage(Lexicon.stepDoorDown("Press space"))
         case .stairsUp: camera.appendGameMessage(Lexicon.stepStairsUp("Press space"))
@@ -918,7 +1202,7 @@ struct ContentView: View {
                 .allowsHitTesting(inBattle)
             BattleHUD(enemyName: enemyName,
                       enemyHP: enemyStats.hp, enemyMaxHP: enemyStats.maxHP,
-                      playerHP: playerStats.hp, playerMaxHP: playerStats.maxHP,
+                      playerHP: playerStats.hp, playerMaxHP: effectivePlayerStats.maxHP,
                       menu: battleMenuOptions,
                       menuIndex: battleMenuIndex,
                       awaitingRoll: awaitingRoll,
@@ -944,12 +1228,9 @@ struct ContentView: View {
                 .fill(Color.white)
                 .opacity(flashAlpha)
                 .allowsHitTesting(false)
-            // Game Over outro — covers everything (scene + HUD +
-            // flashes). Stays up until the player presses SPACE.
-            if let started = gameOverStart {
-                GameOverView(startedAt: started)
-                    .allowsHitTesting(false)
-            }
+            // Game Over outro is rendered full-window by the body-
+            // level overlay (paired with the win screen) so it covers
+            // the 2D map + text log too, not just this pane.
         }
         .offset(shake)
     }
@@ -992,7 +1273,7 @@ struct ContentView: View {
             // combat balance settles.
             if inBattle {
                 HStack(alignment: .top, spacing: 10) {
-                    DebugPlayerStatsView(stats: playerStats)
+                    DebugPlayerStatsView(stats: effectivePlayerStats)
                         .frame(width: 120)
                     DebugEnemyStatsView(name: enemyName,
                                          stats: enemyStats,
@@ -1072,6 +1353,9 @@ enum DungeonTileKind {
     /// A descent door sealed until the player carries this floor's key.
     /// Floors below `DungeonMap.keyFloorStart` never produce these.
     case lockedDoor
+    /// A chest the player has already opened. Inert and visually
+    /// spent so it won't re-trigger; un-opened chests stay `.chest`.
+    case openedChest
 }
 
 struct DungeonTile {
@@ -1299,6 +1583,9 @@ struct DungeonMapView: View {
     /// clears.
     var disabled: Bool = false
     var log: (String) -> Void
+    /// Invoked when the player re-activates their own tile while
+    /// standing on a chest — opens it parent-side (opt-in).
+    var onChest: () -> Void
 
     private var clickToMove: Bool {
         controls == AdventureControls.click.rawValue && !disabled
@@ -1383,6 +1670,7 @@ struct DungeonMapView: View {
         if isPlayer {
             let kind = map.tiles[row][col].kind
             if kind == .door || kind == .lockedDoor || kind == .stairsUp { onStairs() }
+            else if kind == .chest { onChest() }
             return
         }
         guard map.canMoveTo(row: row, col: col) else { return }
@@ -1393,7 +1681,8 @@ struct DungeonMapView: View {
         switch kind {
         case .empty:    log(Lexicon.stepEmpty())
         case .wall:     break  // unreachable — step() rejects wall tiles
-        case .chest:    log(Lexicon.stepChest())
+        case .chest:    log(Lexicon.chestHere("Click again"))
+        case .openedChest: log(Lexicon.chestSpent())
         case .enemy:    log(Lexicon.stepFoe())
         case .door:     log(Lexicon.stepDoorDown("Click again"))
         case .stairsUp: log(Lexicon.stepStairsUp("Click again"))
@@ -1478,6 +1767,7 @@ struct DungeonMapView: View {
         case .stairsUp: return "↑"
         case .keyChest: return "⚷"
         case .lockedDoor: return "⌂"
+        case .openedChest: return "▫"
         }
     }
 
@@ -1491,6 +1781,7 @@ struct DungeonMapView: View {
         case .stairsUp: return Color(red: 1.00, green: 0.55, blue: 0.75)
         case .keyChest: return Color(red: 1.00, green: 0.84, blue: 0.30)
         case .lockedDoor: return Color(red: 0.95, green: 0.45, blue: 0.45)
+        case .openedChest: return Color(white: 0.42)
         }
     }
 }
@@ -1630,6 +1921,7 @@ struct DungeonView3D: NSViewRepresentable {
         var doorSegs:     [(SIMD3<Float>, SIMD3<Float>)] = []
         var lockedDoorSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
         var keyChestSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
+        var openedChestSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
         var stairsUpSegs: [(SIMD3<Float>, SIMD3<Float>)] = []
 
         for r in 0..<rows {
@@ -1687,6 +1979,12 @@ struct DungeonView3D: NSViewRepresentable {
                     addBoxEdges(to: &chestSegs,
                                  center: SIMD3<Float>(p.x, 0.18, p.z),
                                  size: SIMD3<Float>(0.52, 0.36, 0.4))
+                case .openedChest:
+                    // Spent: a flatter, dimmer husk so it reads as
+                    // already-looted at a glance.
+                    addBoxEdges(to: &openedChestSegs,
+                                 center: SIMD3<Float>(p.x, 0.09, p.z),
+                                 size: SIMD3<Float>(0.52, 0.18, 0.4))
                 case .enemy:
                     addPyramidEdges(to: &enemySegs, base: p,
                                      baseSize: 0.52, height: 0.7)
@@ -1712,6 +2010,7 @@ struct DungeonView3D: NSViewRepresentable {
         let doorColor     = NSColor(calibratedRed: 0.45, green: 0.80, blue: 1.00, alpha: 1)
         let lockedDoorColor = NSColor(calibratedRed: 1.00, green: 0.40, blue: 0.40, alpha: 1)
         let keyChestColor = NSColor(calibratedRed: 1.00, green: 0.84, blue: 0.30, alpha: 1)
+        let openedChestColor = NSColor(calibratedRed: 0.45, green: 0.50, blue: 0.45, alpha: 1)
         let stairsUpColor = NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.80, alpha: 1)
 
         for (segs, color) in [
@@ -1723,6 +2022,7 @@ struct DungeonView3D: NSViewRepresentable {
             (doorSegs,     doorColor),
             (lockedDoorSegs, lockedDoorColor),
             (keyChestSegs, keyChestColor),
+            (openedChestSegs, openedChestColor),
             (stairsUpSegs, stairsUpColor),
         ] {
             guard let geom = buildLineGeometry(segments: segs, color: color) else { continue }
@@ -2340,6 +2640,12 @@ enum Lexicon {
     static func fleeUnclear(roll: Int) -> String {
         "You roll \(roll). The result is unclear."
     }
+    static func fleeGuaranteed(_ foe: String) -> String {
+        "You slip away clean — \(foe) never had a chance. (Escape Artist)"
+    }
+    static func lifestealTick(_ hp: Int) -> String {
+        "The strike feeds you — +\(hp) HP. (Lifesteal)"
+    }
     static func foeMisses(_ foe: String) -> String {
         "\(foe) fires — the beam whips past you. (rolls 1)"
     }
@@ -2356,6 +2662,54 @@ enum Lexicon {
     // MARK: Die-roll callouts
     static func rolledDie()           -> String { "YOU ROLLED THE \(die.uppercased())" }
     static func rolledFace(_ f: Int)  -> String { "YOU ROLLED A \(f)" }
+
+    // MARK: Gear item names
+    // Tron-flavored procedural names for generated gear. Names only —
+    // the stats live on GearItem. Swap these pools (or the join) when
+    // the real re-theme lands; everything else stays structural.
+    private static let itemPrefixes = [
+        "Cracked", "Overclocked", "Encrypted", "Glitched", "Recursive",
+        "Quantum", "Phantom", "Null", "Prismatic", "Corrupted",
+    ]
+    private static let itemCores = [
+        "Cipher", "Vector", "Daemon", "Lattice", "Shard",
+        "Protocol", "Fragment", "Sigil", "Kernel", "Echo",
+    ]
+    private static let itemForms = [
+        "Disc", "Module", "Routine", "Relic", "Construct",
+        "Core", "Subroutine", "Token", "Array", "Loop",
+    ]
+    static func randomItem() -> String {
+        let p = itemPrefixes.randomElement() ?? "Cracked"
+        let c = itemCores.randomElement() ?? "Cipher"
+        let f = itemForms.randomElement() ?? "Disc"
+        return "\(p) \(c) \(f)"
+    }
+    // MARK: Chest / gear actions
+    static func chestHere(_ advance: String) -> String {
+        "A \(chestShort) sits here. \(advance) to open it — or leave it."
+    }
+    static func chestOpened(_ name: String, summary: String) -> String {
+        "You open the \(chestShort): \(name) — \(summary). Stowed in your pack."
+    }
+    static func chestSpent() -> String { "An opened \(chestShort), already emptied." }
+    static func backpackFull(_ cap: Int) -> String {
+        "Your pack is full (\(cap)/\(cap)). Manage gear before taking more."
+    }
+    static func equipped(_ name: String, slot: String) -> String {
+        "Equipped \(name) (\(slot))."
+    }
+    static func unequipped(_ name: String) -> String { "Stowed \(name)." }
+    static func discarded(_ name: String) -> String { "Discarded \(name)." }
+
+    // MARK: Demo win screen
+    static let winTitle    = "DEMO CLEAR"
+    static let winSubtitle = "PRESS  SPACE  TO  RUN  IT  AGAIN"
+    static func winHaul(_ count: Int) -> String {
+        count == 0
+            ? "You escaped the \(world) empty-handed."
+            : "You escaped the \(world) with \(count) recovered:"
+    }
 }
 
 struct Stats {
@@ -2368,6 +2722,108 @@ struct Stats {
     var physDef: Int
     var mag: Int     // magic attack
     var magDef: Int
+}
+
+// MARK: - Gear system (locked design — see project memory)
+
+/// The three equip slots. Each accepts exactly one item; finding an
+/// upgrade is the power-fantasy axis, not hoarding.
+enum GearSlot: String, CaseIterable {
+    case weapon, armor, trinket
+    var label: String {
+        switch self {
+        case .weapon:  return "Weapon"
+        case .armor:   return "Armor"
+        case .trinket: return "Trinket"
+        }
+    }
+}
+
+/// Rare deep-floor effects. Most gear is flat stat bumps; a `special`
+/// is the chunky standout on scarce pieces. Kept small and combat-
+/// hookable (no MP/magic specials — magic isn't wired yet).
+enum GearSpecial: String {
+    case none
+    case keenEdge        // crit on a roll of 5 OR 6, not just 6
+    case lifesteal       // heal 2 HP whenever your strike deals damage
+    case guaranteedFlee  // flee always succeeds (no damage taken)
+
+    var blurb: String {
+        switch self {
+        case .none:           return ""
+        case .keenEdge:       return "Keen Edge (crit on 5-6)"
+        case .lifesteal:      return "Lifesteal (+2 HP on hit)"
+        case .guaranteedFlee: return "Escape Artist (flee always works)"
+        }
+    }
+}
+
+/// One gear piece. Effects are flat, chunky stat bumps (benchmarked
+/// so a single weapon is a *felt* swing against a floor-1 Shade) plus
+/// an optional rare special. No stats live here that aren't opt-in.
+struct GearItem: Identifiable {
+    let id = UUID()
+    var name: String
+    var slot: GearSlot
+    var dStr = 0
+    var dSpd = 0
+    var dPhysDef = 0
+    var dMag = 0
+    var dMagDef = 0
+    var dMaxHP = 0
+    var dMaxMP = 0
+    var special: GearSpecial = .none
+
+    /// Compact "+2 STR · +4 HP · Lifesteal"-style readout for menus.
+    var summary: String {
+        var parts: [String] = []
+        if dStr     != 0 { parts.append("\(signed(dStr)) STR") }
+        if dSpd     != 0 { parts.append("\(signed(dSpd)) SPD") }
+        if dPhysDef != 0 { parts.append("\(signed(dPhysDef)) PDF") }
+        if dMag     != 0 { parts.append("\(signed(dMag)) MAG") }
+        if dMagDef  != 0 { parts.append("\(signed(dMagDef)) MDF") }
+        if dMaxHP   != 0 { parts.append("\(signed(dMaxHP)) HP") }
+        if dMaxMP   != 0 { parts.append("\(signed(dMaxMP)) MP") }
+        if special != .none { parts.append(special.blurb) }
+        return parts.isEmpty ? "(no effect)" : parts.joined(separator: " · ")
+    }
+
+    private func signed(_ v: Int) -> String { v >= 0 ? "+\(v)" : "\(v)" }
+
+    /// Depth-scaled roll. Shallow floors give small single-stat bumps;
+    /// deeper floors give bigger bumps and a rising chance of a rare
+    /// special. Magnitudes stay chunky against the 1-20 stat range —
+    /// every point is a felt swing, so the ceiling is deliberately low.
+    static func roll(floor: Int) -> GearItem {
+        let slot = GearSlot.allCases.randomElement() ?? .weapon
+        // Band: ~+1 per 2 floors of headroom, capped so a 5-floor
+        // demo tops out around +3-4 on a primary stat.
+        let band = max(1, min(4, 1 + floor / 2))
+        let lo = max(1, band - 1)
+        func bump() -> Int { Int.random(in: lo...(band + 1)) }
+
+        var item = GearItem(name: Lexicon.randomItem(), slot: slot)
+        switch slot {
+        case .weapon:
+            // Offense piece: STR primary, occasional MAG flavor.
+            if Bool.random() { item.dStr = bump() }
+            else             { item.dMag = bump() }
+            if item.dStr == 0 && item.dMag == 0 { item.dStr = bump() }
+        case .armor:
+            // Survivability: a defense plus a chunk of HP.
+            if Bool.random() { item.dPhysDef = bump() } else { item.dMagDef = bump() }
+            item.dMaxHP = bump() + 2
+        case .trinket:
+            // Utility: SPD / MP, and the home of most specials.
+            if Bool.random() { item.dSpd = bump() } else { item.dMaxMP = bump() + 1 }
+        }
+        // Rare special, weighted by depth. ~0% floor 1 → ~40% floor 5+.
+        let specialChance = Double(max(0, floor - 1)) * 0.10
+        if Double.random(in: 0..<1) < specialChance {
+            item.special = [.keenEdge, .lifesteal, .guaranteedFlee].randomElement() ?? .none
+        }
+        return item
+    }
 }
 
 /// Per-type enemy stat baselines. Add cases as new enemies arrive;
@@ -2687,6 +3143,232 @@ struct GameOverView: View {
         if elapsed < textStart { return 0 }
         let progress = (elapsed - textStart) / Self.textFadeIn
         return min(1, max(0, progress))
+    }
+}
+
+/// DEMO win screen. Same shatter-in cell field as `GameOverView` so
+/// the two outros read as a matched pair, but with a Tron-cyan
+/// palette and a list of the run's collected placeholder loot.
+/// Temporary — replace when real progression / a real end screen
+/// lands.
+struct WinView: View {
+    let startedAt: Date
+    let items: [GearItem]
+
+    static let shatterDuration: Double = 0.45
+    static let textHoldDelay: Double = 0.10
+    static let textFadeIn: Double = 0.40
+
+    private static let cols = 32
+    private static let rows = 18
+    private static let cellCount = cols * rows
+
+    /// Cyan / electric-blue heavy palette — the celebratory inverse
+    /// of GameOver's red, and a preview of the Tron re-theme.
+    private static let palette: [Color] = [
+        Color(red: 0.30, green: 0.95, blue: 1.00),
+        Color(red: 0.15, green: 0.75, blue: 1.00),
+        Color(red: 0.10, green: 0.45, blue: 0.75),
+        Color(red: 0.05, green: 0.20, blue: 0.35),
+        Color(white: 0.04),
+        Color(white: 0.04),
+        Color(white: 0.04),
+    ]
+
+    @State private var cellDelays: [Double] = (0..<WinView.cellCount)
+        .map { _ in Double.random(in: 0...0.85) }
+    @State private var cellColors: [Color] = (0..<WinView.cellCount)
+        .map { _ in WinView.palette.randomElement() ?? .black }
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let elapsed = context.date.timeIntervalSince(startedAt)
+            ZStack {
+                Canvas { ctx, size in
+                    let cellW = size.width / Double(Self.cols)
+                    let cellH = size.height / Double(Self.rows)
+                    for i in 0..<Self.cellCount {
+                        let opacity = cellOpacity(elapsed: elapsed,
+                                                   delay: cellDelays[i])
+                        guard opacity > 0.01 else { continue }
+                        let r = i / Self.cols
+                        let c = i % Self.cols
+                        let rect = CGRect(x: Double(c) * cellW,
+                                          y: Double(r) * cellH,
+                                          width: cellW, height: cellH)
+                        ctx.fill(Path(rect),
+                                 with: .color(cellColors[i].opacity(opacity)))
+                    }
+                }
+                VStack(spacing: 28) {
+                    Text(Lexicon.winTitle)
+                        .font(.system(size: 104, weight: .black, design: .monospaced))
+                        .kerning(10)
+                        .foregroundColor(Color(red: 0.92, green: 0.99, blue: 1.00))
+                        .shadow(color: Color(red: 0.20, green: 0.85, blue: 1.00).opacity(0.9),
+                                radius: 24)
+                    VStack(spacing: 8) {
+                        Text(Lexicon.winHaul(items.count))
+                            .font(.system(size: 20, weight: .bold, design: .monospaced))
+                            .kerning(2)
+                            .foregroundColor(Color(red: 0.80, green: 0.95, blue: 1.00))
+                        ForEach(items) { item in
+                            Text("• \(item.name) — \(item.summary)")
+                                .font(.system(size: 16, weight: .medium, design: .monospaced))
+                                .foregroundColor(Color(red: 0.60, green: 0.90, blue: 1.00))
+                        }
+                    }
+                    Text(Lexicon.winSubtitle)
+                        .font(.system(size: 22, weight: .bold, design: .monospaced))
+                        .kerning(4)
+                        .foregroundColor(Color(red: 0.75, green: 0.92, blue: 1.00))
+                        .padding(.top, 8)
+                }
+                .opacity(textOpacity(elapsed: elapsed))
+            }
+        }
+    }
+
+    private func cellOpacity(elapsed: Double, delay: Double) -> Double {
+        if elapsed < 0 { return 0 }
+        let cellStart = delay * Self.shatterDuration * 0.55
+        let cellElapsed = elapsed - cellStart
+        if cellElapsed <= 0 { return 0 }
+        let fadeIn = Self.shatterDuration * 0.45
+        return min(1, cellElapsed / fadeIn)
+    }
+
+    private func textOpacity(elapsed: Double) -> Double {
+        let textStart = Self.shatterDuration + Self.textHoldDelay
+        if elapsed < textStart { return 0 }
+        let progress = (elapsed - textStart) / Self.textFadeIn
+        return min(1, max(0, progress))
+    }
+}
+
+/// Inventory / equip overlay. Presentation-only — the parent owns
+/// all state and mutation; this just draws the three slots, the
+/// backpack, the live base→effective stat readout, and the cursor.
+/// Cursor index is flat: slots first (in `slotOrder`), then backpack.
+struct InventoryView: View {
+    let slotOrder: [GearSlot]
+    let equipped: [GearSlot: GearItem]
+    let backpack: [GearItem]
+    let selection: Int
+    let base: Stats
+    let effective: Stats
+    let cap: Int
+
+    private static let accent = Color(red: 0.30, green: 0.95, blue: 1.00)
+    private static let dim = Color(white: 0.60)
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.82).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 14) {
+                Text("GEAR")
+                    .font(.system(size: 30, weight: .black, design: .monospaced))
+                    .kerning(8)
+                    .foregroundColor(Self.accent)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(slotOrder.enumerated()), id: \.offset) { i, slot in
+                        row(label: slot.label.uppercased(),
+                            item: equipped[slot],
+                            emptyText: "— empty —",
+                            selected: selection == i)
+                    }
+                }
+
+                Divider().background(Color.white.opacity(0.25))
+
+                Text("PACK  \(backpack.count)/\(cap)")
+                    .font(.system(size: 15, weight: .bold, design: .monospaced))
+                    .foregroundColor(Self.dim)
+                VStack(alignment: .leading, spacing: 5) {
+                    if backpack.isEmpty {
+                        Text("(empty — open chests to fill it)")
+                            .font(.system(size: 15, design: .monospaced))
+                            .foregroundColor(Self.dim)
+                    } else {
+                        ForEach(Array(backpack.enumerated()), id: \.element.id) { i, item in
+                            row(label: nil,
+                                item: item,
+                                emptyText: "",
+                                selected: selection == slotOrder.count + i)
+                        }
+                    }
+                }
+
+                Divider().background(Color.white.opacity(0.25))
+
+                statLine
+                Text("↑↓ select · ⏎ equip/stow · X discard · I close")
+                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+                    .foregroundColor(Self.dim)
+            }
+            .padding(28)
+            .frame(maxWidth: 560, alignment: .leading)
+            .background(Color(white: 0.06))
+            .overlay(RoundedRectangle(cornerRadius: 6)
+                .stroke(Self.accent.opacity(0.5), lineWidth: 1))
+            .cornerRadius(6)
+        }
+    }
+
+    private func row(label: String?, item: GearItem?,
+                     emptyText: String, selected: Bool) -> some View {
+        HStack(spacing: 8) {
+            Text(selected ? "▶" : " ")
+                .font(.system(size: 15, weight: .bold, design: .monospaced))
+                .foregroundColor(Self.accent)
+            if let label {
+                Text(label)
+                    .font(.system(size: 15, weight: .bold, design: .monospaced))
+                    .foregroundColor(Self.dim)
+                    .frame(width: 84, alignment: .leading)
+            }
+            if let item {
+                Text(item.name)
+                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white)
+                Text(item.summary)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundColor(Self.accent.opacity(0.85))
+            } else {
+                Text(emptyText)
+                    .font(.system(size: 15, design: .monospaced))
+                    .foregroundColor(Self.dim)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 6)
+        .background(selected ? Self.accent.opacity(0.16) : Color.clear)
+        .cornerRadius(4)
+    }
+
+    private var statLine: some View {
+        HStack(spacing: 14) {
+            delta("STR", base.str, effective.str)
+            delta("SPD", base.spd, effective.spd)
+            delta("PDF", base.physDef, effective.physDef)
+            delta("MDF", base.magDef, effective.magDef)
+            delta("HP",  base.maxHP, effective.maxHP)
+        }
+    }
+
+    private func delta(_ name: String, _ b: Int, _ e: Int) -> some View {
+        HStack(spacing: 3) {
+            Text(name)
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundColor(Self.dim)
+            Text(e == b ? "\(b)" : "\(b)→\(e)")
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundColor(e > b ? Self.accent
+                                       : (e < b ? Color(red: 1, green: 0.5, blue: 0.4)
+                                                : .white))
+        }
     }
 }
 
