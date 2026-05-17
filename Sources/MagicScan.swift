@@ -446,14 +446,14 @@ struct ContentView: View {
         case .door, .lockedDoor:
             if dungeonMap.tiles[r][c].kind == .lockedDoor {
                 guard dungeonMap.hasKey else {
-                    camera.appendGameMessage("The stairwell is sealed. Find this floor's key first.")
+                    camera.appendGameMessage(Lexicon.gateSealed())
                     return true
                 }
-                camera.appendGameMessage("Your key fits. The stairwell grinds open.")
+                camera.appendGameMessage(Lexicon.keyFits())
             }
             let next = dungeonMap.floor + 1
             guard next <= Self.maxFloor else {
-                camera.appendGameMessage("The door refuses to open. The dungeon ends here.")
+                camera.appendGameMessage(Lexicon.worldEnds())
                 return true
             }
             floorsByNumber[dungeonMap.floor] = dungeonMap
@@ -464,14 +464,14 @@ struct ContentView: View {
                                              spawn: (r, c),
                                              spawnIsStairsUp: true)
             }
-            camera.appendGameMessage("You descend to floor \(dungeonMap.floor).")
+            camera.appendGameMessage(Lexicon.descend(to: dungeonMap.floor))
             return true
         case .stairsUp:
             let prev = dungeonMap.floor - 1
             guard prev >= 1, let saved = floorsByNumber[prev] else { return false }
             floorsByNumber[dungeonMap.floor] = dungeonMap
             dungeonMap = saved
-            camera.appendGameMessage("You ascend to floor \(dungeonMap.floor).")
+            camera.appendGameMessage(Lexicon.ascend(to: dungeonMap.floor))
             return true
         default:
             return false
@@ -519,18 +519,18 @@ struct ContentView: View {
     /// knows what they're about to roll for.
     private var rollPromptText: String {
         switch pendingRoll {
-        case .attack: return "ROLL THE DIE TO STRIKE\nHOLD SPACE — RELEASE TO THROW"
-        case .flee:   return "ROLL THE DIE TO FLEE\nHOLD SPACE — RELEASE TO THROW"
+        case .attack: return Lexicon.rollPrompt(strike: true)
+        case .flee:   return Lexicon.rollPrompt(strike: false)
         case .none:   return ""
         }
     }
 
     private var battleMenuOptions: [BattleMenuOption] {
         [
-            BattleMenuOption(name: "Fight", enabled: true),
-            BattleMenuOption(name: "Item",  enabled: false),
-            BattleMenuOption(name: "Hack",  enabled: false),
-            BattleMenuOption(name: "Flee",  enabled: true),
+            BattleMenuOption(name: Lexicon.menuFight, enabled: true),
+            BattleMenuOption(name: Lexicon.menuItem,  enabled: false),
+            BattleMenuOption(name: Lexicon.menuHack,  enabled: false),
+            BattleMenuOption(name: Lexicon.menuFlee,  enabled: true),
         ]
     }
 
@@ -550,7 +550,7 @@ struct ContentView: View {
         enemyHitImpactStart = nil
         enemyActedThisRound = false
         battleEpoch += 1
-        camera.appendGameMessage("\(enemyName.uppercased()) bars your path. Battle!")
+        camera.appendGameMessage(Lexicon.battleStart(enemyName))
         // Kick off the pixel-shatter + ENGAGE intro and clear the
         // flag when it finishes. Battle inputs gate on this so the
         // player can't shake the die before the overlay clears.
@@ -572,19 +572,18 @@ struct ContentView: View {
     private func confirmMenuSelection() {
         let opt = battleMenuOptions[battleMenuIndex]
         guard opt.enabled else {
-            camera.appendGameMessage("\(opt.name.uppercased()) is not yet available.")
+            camera.appendGameMessage(Lexicon.notAvailable(opt.name))
             return
         }
         let kind: PendingRoll
         let prompt: String
-        switch opt.name {
-        case "Fight":
+        if opt.name == Lexicon.menuFight {
             kind = .attack
-            prompt = "You ready a strike. Roll the die — hold SPACE, release to throw."
-        case "Flee":
+            prompt = Lexicon.readyStrike()
+        } else if opt.name == Lexicon.menuFlee {
             kind = .flee
-            prompt = "You move to flee. Roll the die — hold SPACE, release to throw."
-        default:
+            prompt = Lexicon.readyFlee()
+        } else {
             return
         }
         // Reset the round budget before deciding initiative. Tie goes
@@ -593,7 +592,7 @@ struct ContentView: View {
         enemyActedThisRound = false
         if enemyStats.spd > playerStats.spd {
             camera.appendGameMessage(
-                "\(enemyName.uppercased()) is faster — it strikes first! (SPD \(enemyStats.spd) vs \(playerStats.spd))"
+                Lexicon.foeFaster(enemyName, foeSpd: enemyStats.spd, playerSpd: playerStats.spd)
             )
             // Gate input during the enemy preempt. Open the player's
             // die window only after the laser resolves and the player
@@ -624,20 +623,20 @@ struct ContentView: View {
             // Roll 6 = critical hit (adds flat +2 on top of the
             // normal calc). Both produce extra log flavor.
             if roll == 1 {
-                camera.appendGameMessage("CRITICAL MISS! You roll 1. Your strike goes wide.")
+                camera.appendGameMessage(Lexicon.critMissStrike())
             } else {
                 let isCrit = (roll == 6)
                 let base = playerStats.str + roll - enemyStats.physDef
                 let damage = max(1, base + (isCrit ? 2 : 0))
                 enemyStats.hp = max(0, enemyStats.hp - damage)
-                let prefix = isCrit ? "CRITICAL HIT! " : ""
-                let critTag = isCrit ? " + 2 crit" : ""
                 camera.appendGameMessage(
-                    "\(prefix)You roll \(roll). You strike \(enemyName) for \(damage) damage. (STR \(playerStats.str) + \(roll) − PDF \(enemyStats.physDef)\(critTag))"
+                    Lexicon.strikeHit(roll: roll, foe: enemyName, damage: damage,
+                                      str: playerStats.str, pdf: enemyStats.physDef,
+                                      crit: isCrit)
                 )
                 triggerHitImpact()
                 if enemyStats.hp == 0 {
-                    camera.appendGameMessage("\(enemyName.uppercased()) collapses. The path is clear.")
+                    camera.appendGameMessage(Lexicon.foeCollapses(enemyName))
                     clearDefeatedEnemyTile()
                     defeatedEnemyAt = Date()
                     endsBattle = true
@@ -647,19 +646,19 @@ struct ContentView: View {
             switch roll {
             case 1:
                 playerStats.hp = max(0, playerStats.hp - 3)
-                camera.appendGameMessage("CRITICAL FAIL — \(enemyName) catches you. You take 3 damage.")
+                camera.appendGameMessage(Lexicon.fleeCritFail(enemyName))
             case 2...10:
                 playerStats.hp = max(0, playerStats.hp - 1)
-                camera.appendGameMessage("You roll \(roll). You fail to escape and take 1 damage.")
+                camera.appendGameMessage(Lexicon.fleeFail(roll: roll))
             case 11...19:
-                camera.appendGameMessage("You roll \(roll). You break away and escape!")
+                camera.appendGameMessage(Lexicon.fleeEscape(roll: roll))
                 endsBattle = true
             case 20:
                 enemyStats.hp = max(0, enemyStats.hp - 1)
-                camera.appendGameMessage("CRITICAL SUCCESS — A parting blow lands! You escape and \(enemyName) takes 1 damage.")
+                camera.appendGameMessage(Lexicon.fleeCritSuccess(enemyName))
                 endsBattle = true
             default:
-                camera.appendGameMessage("You roll \(roll). The result is unclear.")
+                camera.appendGameMessage(Lexicon.fleeUnclear(roll: roll))
             }
         }
         // Hold the settled die so the player can read the face; on
@@ -716,15 +715,13 @@ struct ContentView: View {
         // Beam-impact moment: apply damage, red flash + shake, log.
         DispatchQueue.main.asyncAfter(deadline: .now() + windup) {
             if isCritMiss {
-                camera.appendGameMessage(
-                    "\(enemyName) fires — the beam whips past you. (rolls 1)"
-                )
+                camera.appendGameMessage(Lexicon.foeMisses(enemyName))
             } else {
                 playerStats.hp = max(0, playerStats.hp - damage)
-                let prefix = isCritHit ? "CRITICAL HIT! " : ""
-                let critTag = isCritHit ? " + 2 crit" : ""
                 camera.appendGameMessage(
-                    "\(prefix)\(enemyName)'s eye-beam burns you for \(damage). (STR \(enemyStats.str) + \(roll) − PDF \(playerStats.physDef)\(critTag))"
+                    Lexicon.foeHit(enemyName, damage: damage, str: enemyStats.str,
+                                   roll: roll, pdf: playerStats.physDef,
+                                   crit: isCritHit)
                 )
                 triggerEnemyHitImpact()
             }
@@ -737,7 +734,7 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + windup + beamFade) {
             resolvingRoll = false
             if playerStats.hp == 0 {
-                camera.appendGameMessage("You collapse before \(enemyName). Defeated.")
+                camera.appendGameMessage(Lexicon.defeated(enemyName))
                 triggerGameOver()
             } else {
                 then?()
@@ -787,7 +784,7 @@ struct ContentView: View {
             dungeonMap = DungeonMap.make(floor: 1)
         }
         gameOverStart = nil
-        camera.appendGameMessage("You wake. The dungeon resets to its first floor.")
+        camera.appendGameMessage(Lexicon.wake())
     }
 
     /// Kick off the white-flash + screen-shake feedback that plays
@@ -880,18 +877,17 @@ struct ContentView: View {
     private func logStep(_ kind: DungeonTileKind?) {
         guard let kind else { return }
         switch kind {
-        case .empty:    camera.appendGameMessage("You step into an empty space.")
+        case .empty:    camera.appendGameMessage(Lexicon.stepEmpty())
         case .wall:     break  // unreachable — step() rejects wall tiles
-        case .chest:    camera.appendGameMessage("You find a treasure chest.")
-        case .enemy:    camera.appendGameMessage("You spot an enemy.")
-        case .door:     camera.appendGameMessage("You find a door leading down. Press space to descend.")
-        case .stairsUp: camera.appendGameMessage("Stairs lead back up. Press space to ascend.")
+        case .chest:    camera.appendGameMessage(Lexicon.stepChest())
+        case .enemy:    camera.appendGameMessage(Lexicon.stepFoe())
+        case .door:     camera.appendGameMessage(Lexicon.stepDoorDown("Press space"))
+        case .stairsUp: camera.appendGameMessage(Lexicon.stepStairsUp("Press space"))
         case .keyChest:
-            camera.appendGameMessage("You pry open a chest — a heavy KEY rests inside. The sealed stairwell will open now.")
+            camera.appendGameMessage(Lexicon.keyFound())
         case .lockedDoor:
-            camera.appendGameMessage(dungeonMap.hasKey
-                ? "A sealed stairwell. Your key fits — press space to descend."
-                : "A sealed stairwell. You need this floor's key to open it.")
+            camera.appendGameMessage(Lexicon.lockedGate(hasKey: dungeonMap.hasKey,
+                                                        advance: "Press space"))
         }
     }
 
@@ -1395,18 +1391,16 @@ struct DungeonMapView: View {
         // its own feedback. Only newly-revealed tiles log discovery.
         guard let kind = discovered else { return }
         switch kind {
-        case .empty:    log("You step into an empty space.")
+        case .empty:    log(Lexicon.stepEmpty())
         case .wall:     break  // unreachable — step() rejects wall tiles
-        case .chest:    log("You find a treasure chest.")
-        case .enemy:    log("You spot an enemy.")
-        case .door:     log("You find a door leading down. Click again to descend.")
-        case .stairsUp: log("Stairs lead back up. Click again to ascend.")
+        case .chest:    log(Lexicon.stepChest())
+        case .enemy:    log(Lexicon.stepFoe())
+        case .door:     log(Lexicon.stepDoorDown("Click again"))
+        case .stairsUp: log(Lexicon.stepStairsUp("Click again"))
         case .keyChest:
-            log("You pry open a chest — a heavy KEY rests inside. The sealed stairwell will open now.")
+            log(Lexicon.keyFound())
         case .lockedDoor:
-            log(map.hasKey
-                ? "A sealed stairwell. Your key fits — click again to descend."
-                : "A sealed stairwell. You need this floor's key to open it.")
+            log(Lexicon.lockedGate(hasKey: map.hasKey, advance: "Click again"))
         }
     }
 
@@ -2240,6 +2234,130 @@ enum PendingRoll {
 /// 1-20; the d20 you roll IS the attack roll, so stats act as
 /// modifiers (D&D-flavored). Defense is split into physical and
 /// magical; magic costs MP.
+/// Single source of truth for every player-facing flavor term and
+/// message. Re-theming (e.g. fantasy → Tron) is a *data* edit in this
+/// one type — call sites stay structural. Values below are the
+/// current fantasy wording, verbatim; change them, not the call
+/// sites, when a theme swap lands. Duplicate keyboard/mouse discovery
+/// lines now share one definition here (the only difference, the
+/// input affordance, is the `advance` parameter, e.g. "Press space"
+/// vs "Click again").
+enum Lexicon {
+    // MARK: World nouns
+    static let world      = "dungeon"          // the overall space
+    static let level      = "floor"            // one descent layer
+    static let chest      = "treasure chest"
+    static let chestShort = "chest"
+    static let keyUpper   = "KEY"
+    static let key        = "key"
+    static let gate       = "stairwell"        // the locked descent point
+    static let door       = "door"             // an ordinary descent door
+    static let die        = "die"
+    static let foeDefault = "enemy"            // generic, pre-identification
+    static let foeShade   = "Shade"            // the only enemy type so far
+
+    // MARK: Battle menu (must stay in sync with the confirm switch)
+    static let menuFight  = "Fight"
+    static let menuItem   = "Item"
+    static let menuHack   = "Hack"
+    static let menuFlee   = "Flee"
+    static let fleeVerb   = "Flee"             // verb form in prose
+
+    // MARK: Movement / discovery
+    static func stepEmpty() -> String { "You step into an empty space." }
+    static func stepChest() -> String { "You find a \(chest)." }
+    static func stepFoe()   -> String { "You spot an \(foeDefault)." }
+    static func stepDoorDown(_ advance: String) -> String {
+        "You find a \(door) leading down. \(advance) to descend."
+    }
+    static func stepStairsUp(_ advance: String) -> String {
+        "Stairs lead back up. \(advance) to ascend."
+    }
+    static func keyFound() -> String {
+        "You pry open a \(chestShort) — a heavy \(keyUpper) rests inside. The sealed \(gate) will open now."
+    }
+    static func lockedGate(hasKey: Bool, advance: String) -> String {
+        hasKey
+            ? "A sealed \(gate). Your \(key) fits — \(advance.lowercased()) to descend."
+            : "A sealed \(gate). You need this \(level)'s \(key) to open it."
+    }
+
+    // MARK: Stairs / floor transitions
+    static func gateSealed() -> String {
+        "The \(gate) is sealed. Find this \(level)'s \(key) first."
+    }
+    static func keyFits()   -> String { "Your \(key) fits. The \(gate) grinds open." }
+    static func worldEnds() -> String { "The \(door) refuses to open. The \(world) ends here." }
+    static func descend(to n: Int) -> String { "You descend to \(level) \(n)." }
+    static func ascend(to n: Int)  -> String { "You ascend to \(level) \(n)." }
+    static func wake() -> String { "You wake. The \(world) resets to its first \(level)." }
+
+    // MARK: Battle flow
+    static func battleStart(_ foe: String) -> String {
+        "\(foe.uppercased()) bars your path. Battle!"
+    }
+    static func rollPrompt(strike: Bool) -> String {
+        strike
+            ? "ROLL THE \(die.uppercased()) TO STRIKE\nHOLD SPACE — RELEASE TO THROW"
+            : "ROLL THE \(die.uppercased()) TO \(fleeVerb.uppercased())\nHOLD SPACE — RELEASE TO THROW"
+    }
+    static func notAvailable(_ name: String) -> String {
+        "\(name.uppercased()) is not yet available."
+    }
+    static func readyStrike() -> String {
+        "You ready a strike. Roll the \(die) — hold SPACE, release to throw."
+    }
+    static func readyFlee() -> String {
+        "You move to flee. Roll the \(die) — hold SPACE, release to throw."
+    }
+    static func foeFaster(_ foe: String, foeSpd: Int, playerSpd: Int) -> String {
+        "\(foe.uppercased()) is faster — it strikes first! (SPD \(foeSpd) vs \(playerSpd))"
+    }
+    static func critMissStrike() -> String {
+        "CRITICAL MISS! You roll 1. Your strike goes wide."
+    }
+    static func strikeHit(roll: Int, foe: String, damage: Int,
+                          str: Int, pdf: Int, crit: Bool) -> String {
+        let prefix  = crit ? "CRITICAL HIT! " : ""
+        let critTag = crit ? " + 2 crit" : ""
+        return "\(prefix)You roll \(roll). You strike \(foe) for \(damage) damage. (STR \(str) + \(roll) − PDF \(pdf)\(critTag))"
+    }
+    static func foeCollapses(_ foe: String) -> String {
+        "\(foe.uppercased()) collapses. The path is clear."
+    }
+    static func fleeCritFail(_ foe: String) -> String {
+        "CRITICAL FAIL — \(foe) catches you. You take 3 damage."
+    }
+    static func fleeFail(roll: Int) -> String {
+        "You roll \(roll). You fail to escape and take 1 damage."
+    }
+    static func fleeEscape(roll: Int) -> String {
+        "You roll \(roll). You break away and escape!"
+    }
+    static func fleeCritSuccess(_ foe: String) -> String {
+        "CRITICAL SUCCESS — A parting blow lands! You escape and \(foe) takes 1 damage."
+    }
+    static func fleeUnclear(roll: Int) -> String {
+        "You roll \(roll). The result is unclear."
+    }
+    static func foeMisses(_ foe: String) -> String {
+        "\(foe) fires — the beam whips past you. (rolls 1)"
+    }
+    static func foeHit(_ foe: String, damage: Int, str: Int,
+                       roll: Int, pdf: Int, crit: Bool) -> String {
+        let prefix  = crit ? "CRITICAL HIT! " : ""
+        let critTag = crit ? " + 2 crit" : ""
+        return "\(prefix)\(foe)'s eye-beam burns you for \(damage). (STR \(str) + \(roll) − PDF \(pdf)\(critTag))"
+    }
+    static func defeated(_ foe: String) -> String {
+        "You collapse before \(foe). Defeated."
+    }
+
+    // MARK: Die-roll callouts
+    static func rolledDie()           -> String { "YOU ROLLED THE \(die.uppercased())" }
+    static func rolledFace(_ f: Int)  -> String { "YOU ROLLED A \(f)" }
+}
+
 struct Stats {
     var hp: Int
     var maxHP: Int
@@ -2261,7 +2379,7 @@ enum EnemyType {
 
     var displayName: String {
         switch self {
-        case .shade: return "Shade"
+        case .shade: return Lexicon.foeShade
         }
     }
 
@@ -4151,7 +4269,7 @@ struct OrbSceneView: NSViewRepresentable {
                                          forwardGrowth, peakSpeed, throwSpeed))
                     wasGripped = false
                     peakSpeed = 0
-                    camera?.appendGameMessage("YOU ROLLED THE DIE")
+                    camera?.appendGameMessage(Lexicon.rolledDie())
                 } else if wasGripped && totalPress < 0.5 {
                     // Released without a qualifying throw — gentle
                     // roll: pick a random face and quickly tumble to
@@ -4174,7 +4292,7 @@ struct OrbSceneView: NSViewRepresentable {
                     let reason = (smoothedPresence < 0.5) ? "exited_frame" : "opened_hand"
                     Self.debugLog(String(format: "SETTLE reason=\(reason) growth=%.4f peakSpd=%.2f face=\(face)",
                                          forwardGrowth, peakSpeed))
-                    camera?.appendGameMessage("YOU ROLLED THE DIE")
+                    camera?.appendGameMessage(Lexicon.rolledDie())
                     wasGripped = false
                     peakSpeed = 0
                 } else if wasGripped && frameCounter % 3 == 0 {
@@ -4210,7 +4328,7 @@ struct OrbSceneView: NSViewRepresentable {
                     if let face = rolledFace {
                         dieOrientation = OrbSceneView.orientationFor(faceNumber: face, kind: dieKind)
                         dieResult = face
-                        camera?.appendGameMessage("YOU ROLLED A \(face)")
+                        camera?.appendGameMessage(Lexicon.rolledFace(face))
                     }
                     rolledFace = nil
                     angularVelocity = .zero
@@ -4348,7 +4466,7 @@ struct OrbSceneView: NSViewRepresentable {
                         OrbSceneView.nearestFace(to: dieOrientation, kind: dieKind))
                     rolledFace = face
                     dieState = .spinning
-                    camera?.appendGameMessage("YOU ROLLED THE DIE")
+                    camera?.appendGameMessage(Lexicon.rolledDie())
                 }
             case .spinning:
                 let speed = simd_length(angularVelocity)
@@ -4367,7 +4485,7 @@ struct OrbSceneView: NSViewRepresentable {
                     if let face = rolledFace {
                         dieOrientation = OrbSceneView.orientationFor(faceNumber: face, kind: dieKind)
                         dieResult = face
-                        camera?.appendGameMessage("YOU ROLLED A \(face)")
+                        camera?.appendGameMessage(Lexicon.rolledFace(face))
                     }
                     rolledFace = nil
                     angularVelocity = .zero
