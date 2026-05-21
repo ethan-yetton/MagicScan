@@ -22,6 +22,13 @@ struct MagicScanApp: App {
                     camera.toggleRecording()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
+                // Debug: spawn a standalone hack session, no battle
+                // required. ContentView treats the outcome as a no-op
+                // log when not in battle, so you can chain runs.
+                Button("Open Hack Terminal (Debug)") {
+                    camera.hackTestRequest &+= 1
+                }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
             }
         }
 
@@ -39,6 +46,18 @@ struct MagicScanApp: App {
         // with two different face numbers. Suppressing the auto-open
         // means the window only exists when openWindow is called
         // (Casino mode), so there's exactly one live Coordinator.
+        .defaultLaunchBehavior(.suppressed)
+
+        // Hack minigame terminal. Opened when the player picks Hack
+        // from the battle menu; HackView writes the outcome to
+        // `camera.hackOutcome` which ContentView watches to apply
+        // damage (success) or trigger a free enemy hit (failure).
+        // Suppressed at launch so it only exists when summoned.
+        Window("Hack Terminal", id: "hack") {
+            HackView()
+                .environmentObject(camera)
+        }
+        .defaultSize(width: 580, height: 460)
         .defaultLaunchBehavior(.suppressed)
 
         Settings {
@@ -474,6 +493,32 @@ struct ContentView: View {
             guard let result = newValue, awaitingRoll else { return }
             handleRollResult(result)
         }
+        .onChange(of: camera.hackOutcome) { newValue in
+            // HackView posts here when its session ends (timeout or
+            // detonate). Clear right away so a follow-up hack with
+            // the same outcome re-fires. When not in battle this is
+            // a debug run from Cmd+Shift+H — log and bail without
+            // mutating combat state.
+            guard let outcome = newValue else { return }
+            camera.hackOutcome = nil
+            if inBattle {
+                handleHackOutcome(outcome)
+            } else {
+                dismissWindow(id: "hack")
+                switch outcome {
+                case .success(let score):
+                    camera.appendGameMessage("[debug] hack success — score \(score)")
+                case .failure:
+                    camera.appendGameMessage("[debug] hack failure")
+                }
+            }
+        }
+        .onChange(of: camera.hackTestRequest) { _ in
+            // Debug entry point — opens the terminal standalone so
+            // the puzzle can be iterated without battling through to
+            // an enemy. Outcome handler above no-ops when !inBattle.
+            openWindow(id: "hack")
+        }
         .onAppear {
             // The camera is acquired by individual views that need it
             // (CameraPreview / OrbView / EmbeddedOrbView) — no global
@@ -685,7 +730,7 @@ struct ContentView: View {
         [
             BattleMenuOption(name: Lexicon.menuFight, enabled: true),
             BattleMenuOption(name: Lexicon.menuItem,  enabled: false),
-            BattleMenuOption(name: Lexicon.menuHack,  enabled: false),
+            BattleMenuOption(name: Lexicon.menuHack,  enabled: true),
             BattleMenuOption(name: Lexicon.menuFlee,  enabled: true),
         ]
     }
@@ -731,6 +776,13 @@ struct ContentView: View {
             camera.appendGameMessage(Lexicon.notAvailable(opt.name))
             return
         }
+        // Hack opens the terminal window — no die roll. The outcome
+        // is posted on `camera.hackOutcome` and handled by the watcher
+        // below. Bail before the Fight/Flee roll setup.
+        if opt.name == Lexicon.menuHack {
+            beginHack()
+            return
+        }
         let kind: PendingRoll
         let prompt: String
         if opt.name == Lexicon.menuFight {
@@ -762,6 +814,78 @@ struct ContentView: View {
         } else {
             pendingRoll = kind
             camera.appendGameMessage(prompt)
+        }
+    }
+
+    /// Hack flow entry. Mirrors the initiative check from Fight/Flee —
+    /// a faster foe preempts before the terminal opens. After the
+    /// preempt (or immediately, if the player is at least as fast),
+    /// opens the hack window. `resolvingRoll` stays true the whole
+    /// time so battle-menu input is gated until the outcome posts.
+    private func beginHack() {
+        enemyActedThisRound = false
+        camera.hackOutcome = nil
+        let eff = effectivePlayerStats
+        if enemyStats.spd > eff.spd {
+            camera.appendGameMessage(
+                Lexicon.foeFaster(enemyName, foeSpd: enemyStats.spd, playerSpd: eff.spd)
+            )
+            resolvingRoll = true
+            runEnemyTurn {
+                // runEnemyTurn flips resolvingRoll off before this
+                // chain fires. Re-gate and open the terminal.
+                resolvingRoll = true
+                camera.appendGameMessage(Lexicon.hackReady())
+                openWindow(id: "hack")
+            }
+        } else {
+            resolvingRoll = true
+            camera.appendGameMessage(Lexicon.hackReady())
+            openWindow(id: "hack")
+        }
+    }
+
+    /// Resolves the outcome posted by HackView. Success applies a
+    /// MAG-vs-MDF damage hit, scaled by the score the player earned
+    /// (currently from leftover meter time). Failure costs the
+    /// player's turn and hands the enemy a free swing — same penalty
+    /// shape as a botched Flee, but unconditional.
+    private func handleHackOutcome(_ outcome: HackOutcome) {
+        dismissWindow(id: "hack")
+        var endsBattle = false
+        switch outcome {
+        case .success(let score):
+            let eff = effectivePlayerStats
+            let damage = max(1, eff.mag + score - enemyStats.magDef)
+            enemyStats.hp = max(0, enemyStats.hp - damage)
+            camera.appendGameMessage(
+                Lexicon.hackSuccess(foe: enemyName, damage: damage,
+                                    mag: eff.mag, score: score,
+                                    mdf: enemyStats.magDef)
+            )
+            triggerHitImpact()
+            if enemyStats.hp == 0 {
+                camera.appendGameMessage(Lexicon.foeCollapses(enemyName))
+                clearDefeatedEnemyTile()
+                defeatedEnemyAt = Date()
+                endsBattle = true
+            }
+        case .failure:
+            camera.appendGameMessage(Lexicon.hackFailure(enemyName))
+        }
+        // Same post-action cadence as handleRollResult: brief beat,
+        // then either close the battle or yield to the enemy turn.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.postRollHoldSeconds) {
+            if endsBattle {
+                resolvingRoll = false
+                endBattle()
+            } else if enemyActedThisRound {
+                // Enemy already swung this round (preempt). Don't
+                // give them a second turn.
+                resolvingRoll = false
+            } else {
+                runEnemyTurn()
+            }
         }
     }
 
@@ -2646,6 +2770,18 @@ enum Lexicon {
     static func lifestealTick(_ hp: Int) -> String {
         "The strike feeds you — +\(hp) HP. (Lifesteal)"
     }
+
+    // MARK: Hack
+    static func hackReady() -> String {
+        "You jack in. Terminal handshake initialised."
+    }
+    static func hackSuccess(foe: String, damage: Int,
+                            mag: Int, score: Int, mdf: Int) -> String {
+        "EXEC ▸ payload lands on \(foe) for \(damage) damage. (MAG \(mag) + \(score) − MDF \(mdf))"
+    }
+    static func hackFailure(_ foe: String) -> String {
+        "Connection dropped. \(foe) lashes out unopposed."
+    }
     static func foeMisses(_ foe: String) -> String {
         "\(foe) fires — the beam whips past you. (rolls 1)"
     }
@@ -3586,6 +3722,14 @@ final class CameraController: NSObject, ObservableObject {
     @Published var dieResult: Int?
     @Published var gameMessages: [String] = []
     @Published var debugText: String = ""
+    /// Set by HackView when the terminal session ends (success or
+    /// failure). ContentView watches this to apply damage or trigger
+    /// the unblockable enemy swing, then clears it back to nil.
+    @Published var hackOutcome: HackOutcome? = nil
+    /// Bumped by the "Open Hack Terminal" debug command. ContentView
+    /// watches this and pops the hack window without needing a
+    /// battle, so the minigame can be iterated on standalone.
+    @Published var hackTestRequest: Int = 0
 
     func updateDebugText(_ text: String) {
         DispatchQueue.main.async { [weak self] in
@@ -5194,6 +5338,630 @@ struct OrbSceneView: NSViewRepresentable {
                                            markers: markerNodes)
             }
             camera?.updateOrbSnapshot(snap)
+        }
+    }
+}
+
+// MARK: - Hack minigame
+//
+// The Hack action opens a fake-terminal window that takes the place
+// of a die roll. There are three planned phases — decrypt, login,
+// inside — but only the decrypt phase is live in this slice. The
+// login and inside phases auto-resolve as placeholders so the rest
+// of the loop (battle wiring, meter pressure, MAG-vs-MDF damage)
+// can be tuned end-to-end first.
+//
+// Tension comes from a draining "install bar" meter: the player has
+// a fixed budget to figure out the rot key (hidden somewhere in the
+// fake environment — `ps`, `env`, etc.) and type `rot N`. Wrong
+// guesses and misfires shave seconds off the meter; empty meter
+// (or four bad keys) ends the session as a failure, which routes to
+// `handleHackOutcome` and costs the player a free enemy turn.
+
+enum HackOutcome: Equatable {
+    /// Decrypt landed. `score` plays the role of the d6 in the
+    /// standard damage formula — ContentView applies
+    /// `max(1, MAG + score − MDF)`. Scaled by leftover meter so a
+    /// fast crack rewards bigger.
+    case success(score: Int)
+    /// Meter expired, or the player burned their attempts. Caller
+    /// hands the enemy a free hit.
+    case failure
+}
+
+/// Pure helpers for the Caesar puzzle. Kept off the view so unit
+/// testing later doesn't need a SwiftUI host.
+enum HackPuzzle {
+    /// Cleartext credential pool. Lowercase letters + digits + a
+    /// punctuation glyph so the rotated form *looks* scrambled but
+    /// the symbols are obvious anchors when it snaps back.
+    static let credSamples: [String] = [
+        "shade:m4!kr0n",
+        "ghost:r1!byte",
+        "ember:c0re!2x",
+        "nyx:hi!ghway7",
+        "orin:p4!l0ck"
+    ]
+
+    static func makeCreds() -> String {
+        credSamples.randomElement() ?? credSamples[0]
+    }
+
+    /// Last picked location, persisted across HackView instances so
+    /// we can avoid back-to-back repeats. Resets only on app launch
+    /// — fine for the test-loop cadence.
+    private static var lastKeyLocation: HackKeyLocation? = nil
+
+    /// Pick a key location, never matching the previous one. With 8
+    /// spots in the pool that's ~14% per command after the first,
+    /// vs the old 33% across 3 spots that made env feel sticky.
+    static func makeKeyLocation() -> HackKeyLocation {
+        let all = HackKeyLocation.allCases
+        let pool = (lastKeyLocation == nil)
+            ? all
+            : all.filter { $0 != lastKeyLocation }
+        let picked = pool.randomElement() ?? all[0]
+        lastKeyLocation = picked
+        return picked
+    }
+
+    /// Caesar rotation; letters only, case-preserving. Digits and
+    /// punctuation pass through untouched so the cipher still reads
+    /// as a credential and the decrypt visibly "snaps" rather than
+    /// just shifting random glyphs.
+    static func rot(_ s: String, by n: Int) -> String {
+        let shift = ((n % 26) + 26) % 26
+        var out = ""
+        out.reserveCapacity(s.count)
+        for ch in s {
+            guard let scalar = ch.unicodeScalars.first else { out.append(ch); continue }
+            let v = scalar.value
+            if v >= 65 && v <= 90 {
+                let r = (Int(v - 65) + shift) % 26
+                out.append(Character(UnicodeScalar(UInt32(r) + 65)!))
+            } else if v >= 97 && v <= 122 {
+                let r = (Int(v - 97) + shift) % 26
+                out.append(Character(UnicodeScalar(UInt32(r) + 97)!))
+            } else {
+                out.append(ch)
+            }
+        }
+        return out
+    }
+}
+
+/// Where the rot key is hidden on this run. Each command in the
+/// fake environment is a "look here" surface; the player has to
+/// poke around to find which one carries the offset. Each location
+/// has its own visual tell so a player who's seen it once can spot
+/// it again at a glance.
+enum HackKeyLocation: CaseIterable {
+    case ps         // a row in `ps` ends with `key=N`
+    case env        // an env var `SHIFT=N`
+    case version    // `cat /etc/version` reports `(build N)`
+    case whoami     // `whoami` prints a uid in the small-N range
+    case uptime     // `uptime` reads in hours instead of days
+    case motd       // `cat /etc/motd` mentions `grid cycle N`
+    case history    // `history` includes `export OFFSET=N`
+    case netstat    // `netstat` lists a port `:N` tagged [auth]
+}
+
+struct HackView: View {
+    @EnvironmentObject var camera: CameraController
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    // Puzzle state (sealed in onAppear).
+    @State private var rotKey: Int = 0
+    @State private var cleartext: String = ""
+    @State private var ciphertext: String = ""
+    @State private var keyLocation: HackKeyLocation = .ps
+
+    // Terminal state.
+    @State private var lines: [TerminalLine] = []
+    @State private var input: String = ""
+    @State private var phase: HackPhase = .decrypt
+    @State private var attempts: Int = 0
+    @State private var done: Bool = false   // guard against double-fire on outcome
+
+    // Meter.
+    @State private var totalSeconds: Double = 28.0
+    @State private var remaining: Double = 28.0
+    @State private var lastTick: Date = Date()
+    @State private var frozen: Bool = false  // pauses meter during success outro
+    /// Wall-clock start of the current session. Score is computed
+    /// from elapsed time (not leftover meter) so a `keepalive` refill
+    /// keeps the player alive without padding the damage payout.
+    @State private var sessionStart: Date = Date()
+    /// How many keepalive refills the player has used this session.
+    @State private var keepaliveUses: Int = 0
+
+    @FocusState private var inputFocused: Bool
+
+    private static let maxAttempts = 4
+    /// Max keepalive refills per session. Each one snaps the meter
+    /// back to full — generous on purpose so a stuck player doesn't
+    /// just lose to the clock.
+    private static let keepaliveMax = 2
+
+    /// 10 Hz tick. Cheap, and snappy enough that the meter reads as
+    /// real-time rather than stepped.
+    private let tick = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+
+    enum HackPhase { case decrypt, login, inside, done }
+
+    struct TerminalLine: Identifiable {
+        let id = UUID()
+        let text: String
+        let style: LineStyle
+    }
+    enum LineStyle { case command, output, system, error, success }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            titleBar
+            terminalPane
+            MeterView(remaining: remaining, total: totalSeconds)
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+            Text(footerHint)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.green.opacity(0.55))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+        }
+        .background(Color.black)
+        .frame(minWidth: 540, minHeight: 420)
+        .onAppear(perform: start)
+        .onDisappear {
+            // Manual close (red dot, Cmd-W) or any path that didn't
+            // post an outcome — treat as failure so the battle loop
+            // doesn't deadlock on resolvingRoll.
+            if !done {
+                camera.hackOutcome = .failure
+                done = true
+            }
+        }
+        .onReceive(tick) { now in advanceTimer(now: now) }
+    }
+
+    // MARK: Layout pieces
+
+    private var titleBar: some View {
+        HStack(spacing: 8) {
+            Circle().fill(.red).frame(width: 10, height: 10)
+            Circle().fill(.yellow).frame(width: 10, height: 10)
+            Circle().fill(.green).frame(width: 10, height: 10)
+            Spacer()
+            Text("root@shade-04  —  secure shell")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.green.opacity(0.7))
+            Spacer()
+            Text("[hack]")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.green.opacity(0.55))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.black)
+        .overlay(Rectangle().frame(height: 1)
+                    .foregroundStyle(.green.opacity(0.25)),
+                 alignment: .bottom)
+    }
+
+    private var terminalPane: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(lines) { line in
+                        terminalText(line).id(line.id)
+                    }
+                    if phase == .decrypt || phase == .login || phase == .inside {
+                        HStack(spacing: 6) {
+                            Text(promptText)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundStyle(.green)
+                            TextField("", text: $input)
+                                .textFieldStyle(.plain)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundStyle(.green)
+                                .focused($inputFocused)
+                                .onSubmit(submit)
+                                .id("input")
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .onChange(of: lines.count) { _ in
+                withAnimation(.easeOut(duration: 0.12)) {
+                    proxy.scrollTo("input", anchor: .bottom)
+                }
+            }
+        }
+        .background(Color.black)
+    }
+
+    private func terminalText(_ line: TerminalLine) -> some View {
+        let color: Color
+        switch line.style {
+        case .command: color = .green
+        case .output:  color = .green.opacity(0.85)
+        case .system:  color = .cyan
+        case .error:   color = .red.opacity(0.85)
+        case .success: color = .yellow
+        }
+        return Text(line.text.isEmpty ? " " : line.text)
+            .font(.system(.body, design: .monospaced))
+            .foregroundStyle(color)
+            .textSelection(.disabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var promptText: String {
+        switch phase {
+        case .decrypt: return "$"
+        case .login:   return "login:"   // placeholder; phase 2 will toggle to password:
+        case .inside:  return "shade@core:~#"
+        case .done:    return ""
+        }
+    }
+
+    private var footerHint: String {
+        switch phase {
+        case .decrypt:
+            let left = Self.keepaliveMax - keepaliveUses
+            return "  ls │ cat │ ps │ env │ whoami │ uptime │ history │ netstat │ rot N │ keepalive[\(left)] │ help"
+        case .login:   return "  type the decrypted credentials"
+        case .inside:  return "  ps │ kill <pid> │ rm <path> │ help"
+        case .done:    return ""
+        }
+    }
+
+    // MARK: Session lifecycle
+
+    private func start() {
+        // Reset ALL session state. AppKit keeps the HackView instance
+        // alive across dismiss/open cycles, so without this the second
+        // session inherits the first one's `done = true` (finish()
+        // would short-circuit), old terminal lines, a drained meter,
+        // and a `.done` phase that hides the input field.
+        lines.removeAll()
+        input = ""
+        phase = .decrypt
+        attempts = 0
+        done = false
+        frozen = false
+        remaining = totalSeconds
+        keepaliveUses = 0
+        sessionStart = Date()
+
+        cleartext = HackPuzzle.makeCreds()
+        rotKey = Int.random(in: 3...22)
+        ciphertext = HackPuzzle.rot(cleartext, by: rotKey)
+        keyLocation = HackPuzzle.makeKeyLocation()
+
+        addLine("[ root@shade-04 — secure shell ]", .system)
+        addLine("[ session opened. decrypt cred to enter. ]", .system)
+        addLine("", .output)
+        addLine("$ decrypt ./shade.cred", .command)
+        addLine("shade.cred ▸ encrypted", .output)
+        addLine(ciphertext, .output)
+        addLine("[ key required — locate the offset, then run `rot N` ]", .system)
+        addLine("", .output)
+
+        lastTick = Date()
+        DispatchQueue.main.async { inputFocused = true }
+    }
+
+    private func advanceTimer(now: Date) {
+        guard !done, !frozen else { lastTick = now; return }
+        let dt = now.timeIntervalSince(lastTick)
+        lastTick = now
+        remaining = max(0, remaining - dt)
+        if remaining <= 0 { timeout() }
+    }
+
+    private func submit() {
+        let raw = input
+        input = ""
+        let cmd = raw.trimmingCharacters(in: .whitespaces)
+        guard !cmd.isEmpty else { return }
+        addLine("\(promptText) \(cmd)", .command)
+        switch phase {
+        case .decrypt: handleDecrypt(cmd)
+        case .login:   handleLogin(cmd)
+        case .inside:  handleInside(cmd)
+        case .done:    break
+        }
+    }
+
+    // MARK: Phase 1 — decrypt
+
+    private func handleDecrypt(_ cmd: String) {
+        let parts = cmd.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard let head = parts.first?.lowercased() else { return }
+        let arg = parts.dropFirst().first ?? ""
+        switch head {
+        case "help":
+            addLine("commands:", .output)
+            addLine("  ls  cat <file>  ps  env  whoami  uptime  history  netstat", .output)
+            addLine("  rot N  keepalive  help  clear", .output)
+            addLine("  (keepalive refills the meter, up to \(Self.keepaliveMax) times)", .output)
+        case "ls":
+            addLine("shade.cred  /etc/version  /etc/motd  /var/log/access.log  /sys/render", .output)
+        case "cat":
+            renderCat(arg: arg)
+        case "ps":
+            renderPs()
+        case "env":
+            renderEnv()
+        case "whoami":
+            renderWhoami()
+        case "uptime":
+            renderUptime()
+        case "history":
+            renderHistory()
+        case "netstat":
+            renderNetstat()
+        case "keepalive":
+            runKeepalive()
+        case "decrypt":
+            addLine("already staged — cleartext locked, key required", .output)
+        case "rot":
+            if let n = Int(arg), n >= 0, n <= 25 {
+                attemptRot(n: n)
+            } else {
+                addLine("usage: rot <0..25>", .error)
+                penalty(0.5)
+            }
+        case "clear":
+            lines.removeAll()
+        default:
+            addLine("\(head): command not found", .error)
+            penalty(1.0)
+        }
+    }
+
+    private func renderCat(arg: String) {
+        switch arg {
+        case "shade.cred":
+            addLine(ciphertext, .output)
+        case "/etc/version":
+            // Build number always shown — the cipher signal is that
+            // a small build (3..22) means this file holds the key.
+            let build = (keyLocation == .version) ? rotKey : Int.random(in: 30...90)
+            addLine("shade-os 4.4 (build \(build)) [stable]", .output)
+        case "/etc/motd":
+            if keyLocation == .motd {
+                addLine("[motd] grid cycle \(rotKey) — auth window closing.", .output)
+            } else {
+                addLine("[motd] welcome to shade-os. report bugs to /dev/null.", .output)
+            }
+        case "/var/log/access.log":
+            addLine("session #\(Int.random(in: 100...999)) ▸ refused", .output)
+            addLine("session #\(Int.random(in: 100...999)) ▸ refused", .output)
+            addLine("session #\(Int.random(in: 100...999)) ▸ refused", .output)
+        case "/sys/render":
+            addLine("(binary)", .output)
+        case "":
+            addLine("usage: cat <file>", .error)
+            penalty(0.5)
+        default:
+            addLine("cat: \(arg): no such file", .error)
+            penalty(0.5)
+        }
+    }
+
+    private func renderPs() {
+        addLine("  PID  CMD", .output)
+        addLine("  001  init", .output)
+        let renderRow = keyLocation == .ps
+            ? "  044  /sys/render        key=\(rotKey)"
+            : "  044  /sys/render"
+        addLine(renderRow, .output)
+        addLine("  108  /ai/aggression", .output)
+        addLine("  211  /ai/defense", .output)
+        addLine("  337  /core/heart", .output)
+    }
+
+    private func renderEnv() {
+        addLine("USER=shade", .output)
+        addLine("HOME=/home/shade", .output)
+        addLine("SHELL=/bin/dsh", .output)
+        if keyLocation == .env {
+            addLine("SHIFT=\(rotKey)", .output)
+        }
+        addLine("PATH=/usr/bin:/bin", .output)
+    }
+
+    /// Real uids are 1000+. When this command holds the key we print
+    /// a small uid in the 3..22 range, which reads as "off" and so
+    /// signals the offset.
+    private func renderWhoami() {
+        addLine("shade", .output)
+        addLine("groups: shade, grid, render", .output)
+        if keyLocation == .whoami {
+            addLine("uid=\(rotKey) gid=100", .output)
+        } else {
+            addLine("uid=1003 gid=100", .output)
+        }
+    }
+
+    /// A normal uptime reads in days. When this command holds the
+    /// key it reads in hours instead — a small N that wants to be
+    /// noticed.
+    private func renderUptime() {
+        if keyLocation == .uptime {
+            addLine("up \(rotKey) hours, 1 session, load 0.42", .output)
+        } else {
+            addLine("up 3 days, 17:42, 1 session, load 0.14", .output)
+        }
+    }
+
+    /// Recent shell lines. Holds the key when one of the lines is
+    /// an explicit `export OFFSET=N`.
+    private func renderHistory() {
+        var entries = ["ls -la", "ps -ef", "cat /etc/motd", "cd /sys", "ls /var", "ps"]
+        if keyLocation == .history {
+            entries.insert("export OFFSET=\(rotKey)", at: 2)
+        }
+        addLine("history:", .output)
+        for (i, e) in entries.enumerated() {
+            addLine(String(format: "  %3d  %@", i + 1, e), .output)
+        }
+    }
+
+    /// Standard port listing. When this command holds the key one
+    /// of the rows is a port `:N` tagged `[auth]` to mark it as the
+    /// offset.
+    private func renderNetstat() {
+        addLine("proto  local            state", .output)
+        addLine("tcp    0.0.0.0:22       LISTEN", .output)
+        if keyLocation == .netstat {
+            addLine("tcp    0.0.0.0:\(rotKey)        LISTEN  [auth]", .output)
+        }
+        addLine("tcp    0.0.0.0:80       LISTEN", .output)
+        addLine("udp    0.0.0.0:443      LISTEN", .output)
+    }
+
+    private func attemptRot(n: Int) {
+        if n == rotKey {
+            addLine(cleartext, .success)
+            addLine("[ key accepted — credential recovered ]", .success)
+            frozen = true
+            advanceFromDecrypt()
+        } else {
+            addLine("[ key rejected — text still garbled ]", .error)
+            attempts += 1
+            penalty(2.0)
+            if attempts >= Self.maxAttempts && !done {
+                addLine("[ too many bad keys — connection terminated ]", .error)
+                finish(.failure)
+            }
+        }
+    }
+
+    /// Phase-1 → success bridge. Phases 2 and 3 are still stubs;
+    /// we print a placeholder line for each so the structure is
+    /// visible end-to-end, then post the success outcome.
+    private func advanceFromDecrypt() {
+        phase = .login
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            addLine("", .output)
+            addLine("[ phase 2 — login : pending ]", .system)
+            addLine("[ phase 3 — pid hunt : pending ]", .system)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+            addLine("", .output)
+            addLine("EXEC ▸ detonate.payload", .success)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.1) {
+            finish(.success(score: scoreFromTimer()))
+        }
+    }
+
+    /// Translate elapsed time into the 1..6 score slot. Counting
+    /// from wall-clock start (not leftover meter) means a player who
+    /// burned a keepalive can still finish the puzzle but won't max
+    /// the score — the refill bought them survival, not damage.
+    /// Mirrors the meter→score mapping for clean runs: a sub-second
+    /// crack maxes at 6, end-of-budget cracks score 1.
+    private func scoreFromTimer() -> Int {
+        let elapsed = Date().timeIntervalSince(sessionStart)
+        let frac = max(0, min(1, 1 - elapsed / totalSeconds))
+        return max(1, min(6, Int((frac * 5.0).rounded()) + 1))
+    }
+
+    /// `keepalive`: snap the meter back to full. The connection
+    /// metaphor (TCP keepalive packets) is the most terminal-native
+    /// way to dress up "I need more time" — and it gives the player
+    /// a clear, opt-in save without rebalancing the base timer.
+    private func runKeepalive() {
+        guard !frozen else { return }
+        if keepaliveUses >= Self.keepaliveMax {
+            addLine("keepalive: rate-limit exceeded — no refresh slots left", .error)
+            return
+        }
+        keepaliveUses += 1
+        let remainingUses = Self.keepaliveMax - keepaliveUses
+        remaining = totalSeconds
+        addLine("[ keepalive ▸ connection refreshed — \(remainingUses) left ]", .success)
+    }
+
+    // MARK: Phase 2/3 — stubs
+
+    private func handleLogin(_ cmd: String) {
+        // No-op for now. The login phase auto-resolves via
+        // advanceFromDecrypt; the input field stays visible only as
+        // a visual breadcrumb until finish() runs.
+    }
+    private func handleInside(_ cmd: String) {}
+
+    // MARK: Helpers
+
+    private func penalty(_ seconds: Double) {
+        remaining = max(0, remaining - seconds)
+        if remaining <= 0 { timeout() }
+    }
+
+    private func timeout() {
+        guard !done else { return }
+        addLine("", .output)
+        addLine("[ session expired — connection dropped ]", .error)
+        finish(.failure)
+    }
+
+    private func finish(_ outcome: HackOutcome) {
+        guard !done else { return }
+        done = true
+        phase = .done
+        // Brief hold so the player reads the last line before the
+        // window closes and the battle log picks up the result.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+            camera.hackOutcome = outcome
+        }
+    }
+
+    private func addLine(_ text: String, _ style: LineStyle) {
+        lines.append(TerminalLine(text: text, style: style))
+    }
+}
+
+/// Draining "install bar" meter. Mirrors the apt/pip block-bar look
+/// — filled glyphs deplete left-to-right rather than fill — and
+/// shifts color from green → yellow → red as time runs out so the
+/// player feels the pressure without reading the digits.
+struct MeterView: View {
+    let remaining: Double
+    let total: Double
+
+    private static let segments = 28
+
+    private var fraction: Double { max(0, min(1, total > 0 ? remaining / total : 0)) }
+    private var filled: Int { Int(fraction * Double(Self.segments)) }
+    private var color: Color {
+        if fraction > 0.5  { return .green }
+        if fraction > 0.25 { return .yellow }
+        return .red
+    }
+
+    var body: some View {
+        let empty = Self.segments - filled
+        let bar = String(repeating: "▮", count: max(0, filled))
+                + String(repeating: "▯", count: max(0, empty))
+        HStack(spacing: 8) {
+            Text("connection stable for")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.green.opacity(0.55))
+            Text(bar)
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(color)
+            Text(String(format: "%4.1fs", remaining))
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(color)
         }
     }
 }
