@@ -9,6 +9,14 @@ import ScreenCaptureKit
 struct MagicScanApp: App {
     @StateObject private var camera = CameraController()
 
+    init() {
+        // One-shot dev breadcrumb so cred escalation across floors
+        // is verifiable without playing through 15 floors. See
+        // `HackPuzzle.dumpFloorPreview` for the read-it-from-stderr
+        // instructions.
+        HackPuzzle.dumpFloorPreview()
+    }
+
     var body: some Scene {
         WindowGroup("MagicScan") {
             ContentView()
@@ -837,6 +845,9 @@ struct ContentView: View {
     private func beginHack() {
         enemyActedThisRound = false
         camera.hackOutcome = nil
+        // Snapshot the current floor so HackView's cred draw reflects
+        // depth. Read in HackView.start(), never mutated mid-session.
+        camera.hackFloor = dungeonMap.floor
         let eff = effectivePlayerStats
         if enemyStats.spd > eff.spd {
             camera.appendGameMessage(
@@ -3750,6 +3761,12 @@ final class CameraController: NSObject, ObservableObject {
     /// watches this and pops the hack window without needing a
     /// battle, so the minigame can be iterated on standalone.
     @Published var hackTestRequest: Int = 0
+    /// Floor the next hack session will roll creds against. ContentView
+    /// sets this from `dungeonMap.floor` before opening the window;
+    /// HackView reads it in `start()` and passes to `makeCreds(floor:)`.
+    /// Defaulting to 1 keeps the standalone debug opener on the easy
+    /// pool unless a real battle bumped it first.
+    @Published var hackFloor: Int = 1
 
     func updateDebugText(_ text: String) {
         DispatchQueue.main.async { [weak self] in
@@ -5401,19 +5418,60 @@ enum HackOutcome: Equatable {
 /// Pure helpers for the Caesar puzzle. Kept off the view so unit
 /// testing later doesn't need a SwiftUI host.
 enum HackPuzzle {
-    /// Cleartext credential pool. Lowercase letters + digits + a
-    /// punctuation glyph so the rotated form *looks* scrambled but
-    /// the symbols are obvious anchors when it snaps back.
-    static let credSamples: [String] = [
+    /// Cleartext credential pools, banded by floor. Easy fits the
+    /// original ~12-char shape (short user, one `!`, one digit).
+    /// Medium adds a `_` glyph and stretches to ~16. Hard layers a
+    /// second symbol (`#$@`) and a second digit, totaling ~18.
+    /// Lowercase only — the puzzle isn't "spot the case", and the
+    /// rotated form still snaps back cleanly with digits + symbols
+    /// as anchors.
+    static let easyCreds: [String] = [
         "shade:m4!kr0n",
         "ghost:r1!byte",
         "ember:c0re!2x",
         "nyx:hi!ghway7",
         "orin:p4!l0ck"
     ]
+    static let mediumCreds: [String] = [
+        "shade17:m4!kr0n_q",
+        "ghost_op:r1!byte_a",
+        "ember04:c0re!2x_z",
+        "nyx_grid:hi!ghway",
+        "orin:p4!l0ck_q72"
+    ]
+    static let hardCreds: [String] = [
+        "shade04:m4!kr0n#8_q",
+        "ghost_op:r1!byte_a@7",
+        "ember:c0re!2x_z9$p",
+        "nyx_grid:hi!ghway7#k",
+        "orin04:p4!l0ck_q72#"
+    ]
 
-    static func makeCreds() -> String {
-        credSamples.randomElement() ?? credSamples[0]
+    /// Floor-banded cred draw. Bands chosen to mirror the gear-roll
+    /// curve (cheap escalation early, real teeth past floor 10) and
+    /// leave headroom for the post-win compositional layer to keep
+    /// using the same minigame at the same difficulty ceiling.
+    static func makeCreds(floor: Int) -> String {
+        let pool: [String]
+        if floor <= 4       { pool = easyCreds }
+        else if floor <= 9  { pool = mediumCreds }
+        else                { pool = hardCreds }
+        return pool.randomElement() ?? pool[0]
+    }
+
+    /// Launch-time eyeball check: one sample cred per representative
+    /// floor, written to stderr. Run the binary from a terminal
+    /// (`/Applications/MagicScan.app/Contents/MacOS/MagicScan`) to
+    /// confirm length / symbol-count climbs monotonically across the
+    /// six floors. Cheap enough to leave on permanently; remove if
+    /// it becomes noise.
+    static func dumpFloorPreview() {
+        let floors = [1, 3, 5, 8, 12, 20]
+        FileHandle.standardError.write(Data("[hack] cred preview (random per run):\n".utf8))
+        for f in floors {
+            let line = String(format: "[hack] floor %2d: %@\n", f, makeCreds(floor: f))
+            FileHandle.standardError.write(Data(line.utf8))
+        }
     }
 
     /// Last picked location, persisted across HackView instances so
@@ -5683,7 +5741,7 @@ struct HackView: View {
         keepaliveUses = 0
         sessionStart = Date()
 
-        cleartext = HackPuzzle.makeCreds()
+        cleartext = HackPuzzle.makeCreds(floor: camera.hackFloor)
         rotKey = Int.random(in: 3...22)
         ciphertext = HackPuzzle.rot(cleartext, by: rotKey)
         keyLocation = HackPuzzle.makeKeyLocation()
