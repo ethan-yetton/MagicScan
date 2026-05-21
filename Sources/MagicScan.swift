@@ -5365,18 +5365,27 @@ struct OrbSceneView: NSViewRepresentable {
 // MARK: - Hack minigame
 //
 // The Hack action opens a fake-terminal window that takes the place
-// of a die roll. There are three planned phases — decrypt, login,
-// inside — but only the decrypt phase is live in this slice. The
-// login and inside phases auto-resolve as placeholders so the rest
-// of the loop (battle wiring, meter pressure, MAG-vs-MDF damage)
-// can be tuned end-to-end first.
+// of a die roll. Three planned phases — decrypt, login, inside.
+// Phases 1 (decrypt) and 2 (login) are live; phase 3 (PID hunt) is
+// still a placeholder that auto-resolves to success after login.
 //
-// Tension comes from a draining "install bar" meter: the player has
-// a fixed budget to figure out the rot key (hidden somewhere in the
-// fake environment — `ps`, `env`, etc.) and type `rot N`. Wrong
-// guesses and misfires shave seconds off the meter; empty meter
-// (or four bad keys) ends the session as a failure, which routes to
-// `handleHackOutcome` and costs the player a free enemy turn.
+// Phase 1 (decrypt) tension comes from a draining "install bar"
+// meter: the player has a fixed budget to figure out the rot key
+// (hidden somewhere in the fake environment — `ps`, `env`, etc.)
+// and type `rot N`. Wrong guesses and misfires shave seconds off
+// the meter; empty meter (or four bad keys) ends the session as
+// failure.
+//
+// Phase 2 (login) reuses the same meter — it does not refresh on
+// phase transition, so the player feels continuous time pressure
+// and has incentive to crack decrypt fast. The decrypted cleartext
+// is `user:pass`; the prompt rotates `login:` → `password:` and the
+// player retypes each half from memory (or the scrollback). Three
+// wrong attempts total → auth lockout → failure. `keepalive` and
+// `help` are still accepted; everything else is an auth attempt.
+//
+// Either phase failing routes to `handleHackOutcome(.failure)` and
+// costs the player a free enemy turn.
 
 enum HackOutcome: Equatable {
     /// Decrypt landed. `score` plays the role of the d6 in the
@@ -5483,6 +5492,13 @@ struct HackView: View {
     @State private var attempts: Int = 0
     @State private var done: Bool = false   // guard against double-fire on outcome
 
+    // Phase 2 (login). `loginStage` walks `login:` → `password:`;
+    // `loginStrikes` counts wrong creds across both prompts. Reset
+    // every session in `start()`.
+    @State private var loginStage: LoginStage = .username
+    @State private var loginStrikes: Int = 0
+    enum LoginStage { case username, password }
+
     // Meter.
     @State private var totalSeconds: Double = 28.0
     @State private var remaining: Double = 28.0
@@ -5502,6 +5518,10 @@ struct HackView: View {
     /// back to full — generous on purpose so a stuck player doesn't
     /// just lose to the clock.
     private static let keepaliveMax = 2
+    /// Strikes allowed in the login phase before the auth daemon
+    /// locks out the session. Three is tight enough to bite without
+    /// being punitive for a typo on a clearly-readable cleartext.
+    private static let loginMaxStrikes = 3
 
     /// 10 Hz tick. Cheap, and snappy enough that the meter reads as
     /// real-time rather than stepped.
@@ -5623,7 +5643,7 @@ struct HackView: View {
     private var promptText: String {
         switch phase {
         case .decrypt: return "$"
-        case .login:   return "login:"   // placeholder; phase 2 will toggle to password:
+        case .login:   return loginStage == .username ? "login:" : "password:"
         case .inside:  return "shade@core:~#"
         case .done:    return ""
         }
@@ -5634,7 +5654,10 @@ struct HackView: View {
         case .decrypt:
             let left = Self.keepaliveMax - keepaliveUses
             return "  ls │ cat │ ps │ env │ whoami │ uptime │ history │ netstat │ rot N │ keepalive[\(left)] │ help"
-        case .login:   return "  type the decrypted credentials"
+        case .login:
+            let left = Self.keepaliveMax - keepaliveUses
+            let triesLeft = Self.loginMaxStrikes - loginStrikes
+            return "  type the decrypted credentials  │  keepalive[\(left)]  │  \(triesLeft) tries left"
         case .inside:  return "  ps │ kill <pid> │ rm <path> │ help"
         case .done:    return ""
         }
@@ -5652,6 +5675,8 @@ struct HackView: View {
         input = ""
         phase = .decrypt
         attempts = 0
+        loginStage = .username
+        loginStrikes = 0
         done = false
         frozen = false
         remaining = totalSeconds
@@ -5864,22 +5889,21 @@ struct HackView: View {
         }
     }
 
-    /// Phase-1 → success bridge. Phases 2 and 3 are still stubs;
-    /// we print a placeholder line for each so the structure is
-    /// visible end-to-end, then post the success outcome.
+    /// Phase 1 → 2 bridge. Short freeze so the player reads the
+    /// "key accepted" snap, then we resume the meter and rotate
+    /// into the login prompts. No meter refresh on transition —
+    /// continuous pressure is the whole point of the act break.
     private func advanceFromDecrypt() {
-        phase = .login
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            guard !done else { return }
+            phase = .login
+            frozen = false
             addLine("", .output)
-            addLine("[ phase 2 — login : pending ]", .system)
-            addLine("[ phase 3 — pid hunt : pending ]", .system)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-            addLine("", .output)
-            addLine("EXEC ▸ detonate.payload", .success)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.1) {
-            finish(.success(score: scoreFromTimer()))
+            addLine("[ auth daemon online — present credentials ]", .system)
+            // Defensive re-focus: the TextField persists across the
+            // phase change, but the prompt label swap can race with
+            // SwiftUI's focus bookkeeping on rebuild.
+            DispatchQueue.main.async { inputFocused = true }
         }
     }
 
@@ -5911,13 +5935,75 @@ struct HackView: View {
         addLine("[ keepalive ▸ connection refreshed — \(remainingUses) left ]", .success)
     }
 
-    // MARK: Phase 2/3 — stubs
+    // MARK: Phase 2 — login
 
+    /// Two-step credential gate. The decrypted cleartext is
+    /// `user:pass`; we split once and match each half against the
+    /// current prompt. `keepalive` and `help` are still honored so
+    /// the player retains the same survive-the-clock affordances
+    /// from Phase 1. Anything else is treated as an auth attempt
+    /// and burns a strike on mismatch.
     private func handleLogin(_ cmd: String) {
-        // No-op for now. The login phase auto-resolves via
-        // advanceFromDecrypt; the input field stays visible only as
-        // a visual breadcrumb until finish() runs.
+        let lower = cmd.lowercased()
+        switch lower {
+        case "help":
+            addLine("auth daemon: enter the username, then the password.", .output)
+            addLine("(\(Self.loginMaxStrikes) bad creds triggers lockout. keepalive still works.)", .output)
+            return
+        case "keepalive":
+            runKeepalive()
+            return
+        default:
+            break
+        }
+        // Cleartext shape is `user:pass`. Anything else is a bug
+        // in the cred pool — fail safe rather than misjudge input.
+        let halves = cleartext.split(separator: ":", maxSplits: 1,
+                                     omittingEmptySubsequences: false).map(String.init)
+        guard halves.count == 2 else {
+            finish(.failure)
+            return
+        }
+        let expected = loginStage == .username ? halves[0] : halves[1]
+        if cmd == expected {
+            if loginStage == .username {
+                addLine("[ user recognized — password challenge ]", .system)
+                loginStage = .password
+            } else {
+                addLine("[ access granted ]", .success)
+                advanceFromLogin()
+            }
+            return
+        }
+        loginStrikes += 1
+        let triesLeft = Self.loginMaxStrikes - loginStrikes
+        addLine("[ access denied — \(max(0, triesLeft)) tries left ]", .error)
+        penalty(1.5)
+        if loginStrikes >= Self.loginMaxStrikes && !done {
+            addLine("[ auth lockout — connection severed ]", .error)
+            finish(.failure)
+        }
     }
+
+    /// Phase 2 → success bridge. Phase 3 (PID hunt) is still a
+    /// placeholder, so we print the "phase 3 pending" line and
+    /// auto-resolve to success. When Phase 3 lands this routes
+    /// into the next handler instead.
+    private func advanceFromLogin() {
+        frozen = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            addLine("[ phase 3 — pid hunt : pending ]", .system)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            addLine("EXEC ▸ detonate.payload", .success)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.9) {
+            finish(.success(score: scoreFromTimer()))
+        }
+    }
+
+    // MARK: Phase 3 — stub
+
     private func handleInside(_ cmd: String) {}
 
     // MARK: Helpers
