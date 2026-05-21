@@ -285,6 +285,11 @@ struct ContentView: View {
     /// first uses up that round's turn budget. Cleared the moment the
     /// player picks a new action.
     @State private var enemyActedThisRound: Bool = false
+    /// Hack charges remaining in the current battle. Base 1, plus one
+    /// per equipped piece carrying the `.extraHack` special. Reset at
+    /// `startBattle`, decremented by `handleHackOutcome`. Drives the
+    /// Hack menu's enabled flag.
+    @State private var hackChargesRemaining: Int = 0
     /// Set the moment the player's HP hits 0. Drives the GAME OVER
     /// shatter outro; nil = normal play. SPACE while non-nil runs
     /// `restartFromGameOver`. All other input is blocked.
@@ -730,7 +735,7 @@ struct ContentView: View {
         [
             BattleMenuOption(name: Lexicon.menuFight, enabled: true),
             BattleMenuOption(name: Lexicon.menuItem,  enabled: false),
-            BattleMenuOption(name: Lexicon.menuHack,  enabled: true),
+            BattleMenuOption(name: Lexicon.menuHack,  enabled: hackChargesRemaining > 0),
             BattleMenuOption(name: Lexicon.menuFlee,  enabled: true),
         ]
     }
@@ -750,6 +755,9 @@ struct ContentView: View {
         hitImpactStart = nil
         enemyHitImpactStart = nil
         enemyActedThisRound = false
+        // Hack budget for this fight: 1 base + 1 per equipped item with
+        // the .extraHack special. Spent on both success and failure.
+        hackChargesRemaining = 1 + equipped.values.filter { $0.special == .extraHack }.count
         battleEpoch += 1
         camera.appendGameMessage(Lexicon.battleStart(enemyName))
         // Kick off the pixel-shatter + ENGAGE intro and clear the
@@ -773,7 +781,11 @@ struct ContentView: View {
     private func confirmMenuSelection() {
         let opt = battleMenuOptions[battleMenuIndex]
         guard opt.enabled else {
-            camera.appendGameMessage(Lexicon.notAvailable(opt.name))
+            if opt.name == Lexicon.menuHack {
+                camera.appendGameMessage(Lexicon.hackSpent())
+            } else {
+                camera.appendGameMessage(Lexicon.notAvailable(opt.name))
+            }
             return
         }
         // Hack opens the terminal window — no die roll. The outcome
@@ -852,6 +864,9 @@ struct ContentView: View {
     /// shape as a botched Flee, but unconditional.
     private func handleHackOutcome(_ outcome: HackOutcome) {
         dismissWindow(id: "hack")
+        // Both success and failure spend a charge — the attempt itself
+        // is what's gated, not its result.
+        hackChargesRemaining = max(0, hackChargesRemaining - 1)
         var endsBattle = false
         switch outcome {
         case .success(let score):
@@ -2728,6 +2743,9 @@ enum Lexicon {
     static func notAvailable(_ name: String) -> String {
         "\(name.uppercased()) is not yet available."
     }
+    static func hackSpent() -> String {
+        "No hack charges left this fight."
+    }
     static func readyStrike() -> String {
         "You ready a strike. Roll the \(die) — hold SPACE, release to throw."
     }
@@ -2883,6 +2901,7 @@ enum GearSpecial: String {
     case keenEdge        // crit on a roll of 5 OR 6, not just 6
     case lifesteal       // heal 2 HP whenever your strike deals damage
     case guaranteedFlee  // flee always succeeds (no damage taken)
+    case extraHack       // +1 Hack charge per battle (stacks across slots)
 
     var blurb: String {
         switch self {
@@ -2890,6 +2909,7 @@ enum GearSpecial: String {
         case .keenEdge:       return "Keen Edge (crit on 5-6)"
         case .lifesteal:      return "Lifesteal (+2 HP on hit)"
         case .guaranteedFlee: return "Escape Artist (flee always works)"
+        case .extraHack:      return "Backdoor (+1 Hack/battle)"
         }
     }
 }
@@ -2956,7 +2976,7 @@ struct GearItem: Identifiable {
         // Rare special, weighted by depth. ~0% floor 1 → ~40% floor 5+.
         let specialChance = Double(max(0, floor - 1)) * 0.10
         if Double.random(in: 0..<1) < specialChance {
-            item.special = [.keenEdge, .lifesteal, .guaranteedFlee].randomElement() ?? .none
+            item.special = [.keenEdge, .lifesteal, .guaranteedFlee, .extraHack].randomElement() ?? .none
         }
         return item
     }
